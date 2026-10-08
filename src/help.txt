@@ -1,0 +1,40 @@
+=========================================================
+COMANDOS SUPORTADOS - FEDERATED ENGINE
+=========================================================
+[ GERENCIAMENTO DE WORKSPACES ]
+  CREATE WORKSPACE <nome>;      -> Cria um novo ambiente isolado
+  USE <nome>;                   -> Muda o terminal para o workspace
+  SHOW WORKSPACES;              -> Lista todos os workspaces
+
+[ GERENCIAMENTO DE OBJETOS (CATALOGO) ]
+  SHOW TABLES;                  -> Lista as Tabelas Fisicas e Views
+  INFO <tabela>;                -> Mostra o esquema de colunas (tipos)
+  DROP TABLE <tabela>;          -> Remove o mapeamento da tabela
+  DROP VIEW <view>;             -> Remove a view
+  ALTER TABLE <t> ALTER COLUMN <c> TYPE <tipo>; -> Muda tipo (ex: Float64)
+
+[ MAPEAMENTO DE DADOS (LOCAL E REDE) ]
+  CREATE EXTERNAL TABLE <nome> LOCATION '<caminho.csv>';
+  CREATE EXTERNAL TABLE <nome> LOCATION 'http://IP:8080/query?view=nome';
+  -- Views P2P mapeiam o esquema sem baixar os dados; filtros sao enviados ao no remoto.
+  CREATE VIEW <nome> AS SELECT ...;
+
+[ CONSULTAS OLAP ]
+  SELECT col1, col2 FROM tabela WHERE col1 > 10 AND col2 = 'X';
+  SELECT ... JOIN outratabela ON id = id;
+  SELECT ... GROUP BY col1;
+  SELECT ... ORDER BY col1 DESC;
+  COPY (SELECT ...) TO 'arquivo.csv';
+
+[ MARKETPLACE & P2P (REDE LOCAL) ]
+  PUBLISH VIEW <nome>;          -> Expoe uma View local para a rede
+  SERVE ON <porta>;             -> Inicia o servidor transmissor de dados
+  SHOW NETWORK NODES;          -> Descobre nos da engine na sub-rede local (porta 8080)
+
+[ CACHE REMOTO ]
+  REFRESH TABLE <tabela>;       -> Atualiza o cache de uma tabela externa HTTP
+
+[ SISTEMA ]
+  CLEAR                         -> Limpa a tela do terminal
+  EXIT / QUIT                   -> Encerra o motor
+=========================================================

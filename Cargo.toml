@@ -1,0 +1,15 @@
+[package]
+name = "federated_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "53.0.0", features = ["csv"] }
+sqlparser = "0.45"
+rustyline = "14.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+rouille = "3.6"
+ureq = "2.9"
+if-addrs = "0.13"
+serde_json = "1.0"

@@ -1,0 +1,6 @@
+active_workspace: default
+workspaces:
+  default:
+    tables: {}
+    views: {}
+    published_views: []
