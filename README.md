@@ -289,4 +289,3 @@ Ao enviar uma tag de versão, como `v0.1.0`, o [workflow de release](.github/wor
 
 Issues e pull requests são bem-vindos. Para alterações de código, inclua testes focados nas mudanças de comportamento e execute `cargo fmt --check` e `cargo test` antes de enviar sua contribuição.
 
-Antes de publicar este repositório como open source, adicione um arquivo `LICENSE` com a licença escolhida para o projeto e confirme que dependências, dados de exemplo e demais recursos podem ser redistribuídos de acordo com os respectivos termos. No momento, este repositório não declara uma licença para o projeto.
