@@ -1,80 +1,83 @@
 # Federated Engine
 
-**Virtualize local and networked data behind one SQL interface.**
+**Virtualize dados locais e em rede usando uma única interface SQL.**
 
-Federated Engine is a Rust-based data virtualization engine. It maps CSV and Parquet files, as well as published views on other Federated Engine nodes, into a workspace catalog and lets you query those sources with a SQL interface. Apache Arrow provides the in-memory columnar representation; Rayon parallelizes selected batch operations; an optional PostgreSQL Wire Protocol endpoint makes the catalog accessible to PostgreSQL-aware tools.
+O Federated Engine é um mecanismo de virtualização de dados escrito em Rust. Ele registra arquivos CSV e Parquet, além de views publicadas por outros nós Federated Engine, em um catálogo organizado por workspaces e permite consultar essas fontes por meio de uma interface SQL. O Apache Arrow fornece a representação colunar em memória; o Rayon paraleliza operações selecionadas sobre lotes de dados; e um endpoint opcional compatível com o PostgreSQL Wire Protocol conecta ferramentas que reconhecem o protocolo PostgreSQL.
 
-> **Compatibility:** SQL and PostgreSQL compatibility are intentionally a subset, not a claim of full PostgreSQL compatibility. Review the limitations and network-security notes before using it with important data or exposing it to an untrusted network.
+**Idiomas: Português (Brasil) | [English](README.en.md)**
 
-## At a glance
+> **Compatibilidade:** o suporte a SQL e ao protocolo PostgreSQL é intencionalmente parcial; o projeto não oferece compatibilidade completa com PostgreSQL. Consulte as limitações e as observações de segurança de rede antes de usar dados importantes ou expor o serviço a redes não confiáveis.
 
-| Capability | What it does |
+## Visão geral
+
+| Recurso | O que oferece |
 | --- | --- |
-| Data virtualization | Register local CSV/Parquet files and query them through logical table names. |
-| SQL interface | Run queries in a line-oriented prompt or use the guided terminal UI. |
-| Arrow execution | Read data into Apache Arrow record batches for columnar processing. |
-| Parallel operations | Use Rayon for selected in-memory batch and filter operations. |
-| P2P views | Publish a view over HTTP and query it from another node. |
-| Filter pushdown | Send supported predicates to a remote Federated Engine view. |
-| BI connectivity | Serve a PostgreSQL-compatible wire endpoint for local client tools. |
-| Export | Write query results to CSV or Parquet. |
+| Virtualização de dados | Registre arquivos CSV/Parquet locais e consulte-os por nomes lógicos de tabelas. |
+| Interface SQL | Execute consultas em um prompt de comandos ou use a interface guiada no terminal. |
+| Execução com Arrow | Leia dados em record batches do Apache Arrow para processamento colunar. |
+| Operações paralelas | Use Rayon em operações selecionadas sobre lotes e filtros em memória. |
+| Views P2P | Publique uma view por HTTP e consulte-a a partir de outro nó. |
+| Filter Pushdown | Envie predicados compatíveis para uma view remota do Federated Engine. |
+| Conectividade com BI | Disponibilize um endpoint compatível com o protocolo PostgreSQL para clientes locais. |
+| Exportação | Grave resultados de consultas em CSV ou Parquet. |
 
-## How it fits together
+## Arquitetura
 
 ```text
- ┌───────────────────┐         SQL / PostgreSQL Wire         ┌──────────────────────┐
- │ DBeaver / BI tool │ ─────────────────────────────────────> │ Federated Engine     │
- └───────────────────┘                                        │ catalog + SQL parser │
-                                                              └──────────┬───────────┘
-                                                                         │
-                                                          Arrow record batches
-                                                                         │
-                    ┌────────────────────────────────────────────────────┴───────────┐
-                    │                                                                │
-             ┌──────▼───────┐                                                ┌───────▼────────┐
-             │ Local CSV / │                                                │ Remote Engine  │
-             │ Parquet     │                                                │ published view │
-             └─────────────┘                                                └───────┬────────┘
-                                                                                   │
-                                                                   HTTP query + optional filter
+ ┌───────────────────┐          SQL / PostgreSQL Wire         ┌──────────────────────┐
+ │ DBeaver / BI tool │ ──────────────────────────────────────> │ Federated Engine     │
+ └───────────────────┘                                         │ catálogo + parser SQL│
+                                                               └──────────┬───────────┘
+                                                                          │
+                                                           Arrow record batches
+                                                                          │
+                     ┌────────────────────────────────────────────────────┴───────────┐
+                     │                                                                │
+              ┌──────▼───────┐                                                ┌───────▼────────┐
+              │ CSV /        │                                                │ Nó remoto do   │
+              │ Parquet local│                                                │ Federated Engine│
+              └──────────────┘                                                │ view publicada │
+                                                                              └───────┬────────┘
+                                                                                      │
+                                                                    Consulta HTTP + filtro opcional
 ```
 
-### Data virtualization and execution
+### Virtualização e execução de dados
 
-`CREATE EXTERNAL TABLE` registers a source in the active workspace; it does not copy a local file into a database. CSV schemas are inferred from the file, while Parquet schemas are read from the Parquet metadata. A logical table name is then used by SQL queries.
+`CREATE EXTERNAL TABLE` registra uma fonte no workspace ativo; ele não importa o arquivo para um banco de dados. O esquema de arquivos CSV é inferido a partir do conteúdo, enquanto o esquema Parquet é lido dos metadados do próprio arquivo. Depois, as consultas SQL usam o nome lógico registrado.
 
-At query time, the engine reads sources into Arrow record batches, applies supported SQL operations, and can export the result. Selected batch-level operations use Rayon to work in parallel. The engine is not a storage engine: data remains in its source file or is fetched into a local cache for supported remote sources.
+Durante a consulta, o mecanismo lê as fontes em record batches do Arrow, aplica as operações SQL compatíveis e pode exportar o resultado. Operações selecionadas sobre os lotes usam Rayon para processamento paralelo. O Federated Engine não é um mecanismo de armazenamento: os dados permanecem nos arquivos de origem ou são obtidos em um cache local nos casos compatíveis de fontes remotas.
 
-### P2P architecture: published views, discovery, and filter pushdown
+### Arquitetura P2P: views publicadas, descoberta e Filter Pushdown
 
-Each HTTP node can expose published views on port `8080`:
+Cada nó HTTP pode disponibilizar views publicadas na porta `8080`:
 
-- `PUBLISH VIEW` marks a view for sharing.
-- `SERVE ON 8080;` starts the HTTP node.
-- `GET /catalog` lists published views and their workspaces.
-- `GET /query?view=<view>&workspace=<workspace>` returns view results as CSV.
-- `GET /query?view=<view>&workspace=<workspace>&schema_only=true` returns the inferred view schema.
+- `PUBLISH VIEW` marca uma view para compartilhamento.
+- `SERVE ON 8080;` inicia o nó HTTP.
+- `GET /catalog` lista as views publicadas e seus workspaces.
+- `GET /query?view=<view>&workspace=<workspace>` retorna os resultados da view em CSV.
+- `GET /query?view=<view>&workspace=<workspace>&schema_only=true` retorna o esquema inferido da view.
 
-Another node can register that `/query` URL as an external table. For supported predicates, the requesting engine sends a `filter` parameter to the source node so filtering happens close to the data instead of transferring every row first. Supported remote predicates include comparisons, `LIKE`, `IN`, and combinations using `AND`/`OR`, with literal values. Unsupported or complex expressions are not a general-purpose remote SQL language.
+Outro nó pode registrar essa URL `/query` como uma tabela externa. Para predicados compatíveis, o mecanismo solicitante envia um parâmetro `filter` ao nó de origem, para que o filtro seja aplicado próximo dos dados e não seja necessário transferir todas as linhas primeiro. Os filtros remotos compatíveis incluem comparações, `LIKE`, `IN` e combinações com `AND`/`OR`, usando valores literais. Expressões não compatíveis ou complexas não são suportadas como uma linguagem SQL remota genérica.
 
-`SHOW NETWORK NODES;` scans active private IPv4 subnets for Federated Engine nodes on port `8080`. Discovery is intended for a local network; it is not a directory service or Internet-wide peer discovery mechanism.
+`SHOW NETWORK NODES;` procura nós Federated Engine nas sub-redes IPv4 privadas ativas, na porta `8080`. A descoberta foi projetada para redes locais: ela não é um serviço de diretório nem um mecanismo de descoberta de peers na Internet.
 
 ### PostgreSQL Wire Protocol
 
-`SERVE PG ON 5432;` starts the PostgreSQL-compatible endpoint for clients such as DBeaver. The endpoint can execute supported `SELECT` queries against the active workspace and exposes workspace tables and columns through the supported metadata responses.
+`SERVE PG ON 5432;` inicia o endpoint compatível com PostgreSQL para clientes como o DBeaver. O endpoint executa consultas `SELECT` compatíveis no workspace ativo e disponibiliza tabelas e colunas do workspace por meio das respostas de metadados implementadas.
 
-This is a wire-protocol compatibility layer, not an embedded PostgreSQL server. It does not provide PostgreSQL's full SQL surface, transaction semantics, authentication, roles, extensions, or complete system catalogs. The current PostgreSQL listener binds to `127.0.0.1`, so it is intended for local clients on the same machine. Do not assume that arbitrary PostgreSQL drivers or BI features will work.
+Essa camada oferece compatibilidade de protocolo, não um servidor PostgreSQL integrado. Ela não implementa toda a linguagem SQL do PostgreSQL, semântica completa de transações, autenticação, roles, extensões ou todos os catálogos de sistema. O listener atual do PostgreSQL está vinculado a `127.0.0.1` e se destina a clientes na mesma máquina. Não presuma que qualquer driver PostgreSQL ou recurso de BI será compatível.
 
-## Requirements
+## Requisitos
 
-- Rust stable and Cargo for building from source.
-- A terminal for the interactive TUI or raw prompt.
-- Read access to source files (and write access to the working directory for the catalog, caches, and exports).
-- Docker, if running the container image.
+- Rust stable e Cargo para compilar a partir do código-fonte.
+- Um terminal para usar a interface TUI ou o prompt de comandos.
+- Permissão de leitura nos arquivos de origem e de escrita no diretório de trabalho para o catálogo, caches e exportações.
+- Docker, caso queira executar a imagem de container.
 
-## Get started
+## Primeiros passos
 
-### Build and run locally
+### Compilar e executar localmente
 
 ```bash
 git clone https://github.com/henriqueSantsil/federated_engine.git
@@ -83,27 +86,27 @@ cargo build --release
 ./target/release/federated_engine
 ```
 
-On Windows, run `target\release\federated_engine.exe`.
+No Windows, execute `target\release\federated_engine.exe`.
 
-On startup, choose **Raw mode** to type commands, or the selectable interface to navigate the categorized TUI. The TUI includes submenus for queries/views, tables/files, network/servers, and workspaces.
+Ao iniciar, escolha **Raw mode** para digitar comandos ou a interface selecionável para navegar pela TUI organizada por categorias. A TUI inclui submenus para consultas e views, tabelas e arquivos, rede e servidores, além de workspaces.
 
-The catalog is loaded from and saved to `.federated_catalog.yaml` in the current working directory. Keep that file and any source files available between runs.
+O catálogo é carregado de e salvo em `.federated_catalog.yaml` no diretório de trabalho atual. Mantenha esse arquivo e os arquivos de origem disponíveis entre as execuções.
 
-### Run the HTTP node without an interactive terminal
+### Executar o nó HTTP sem terminal interativo
 
-The ordinary executable opens the interactive interface. For a container or other headless deployment, use the dedicated HTTP-server mode:
+O executável padrão abre a interface interativa. Para executar em um container ou ambiente sem terminal, use o modo dedicado de servidor HTTP:
 
 ```bash
 ./target/release/federated_engine --serve-http 8080
 ```
 
-This starts the HTTP P2P server with the catalog in the current working directory. The process stays in the foreground so container managers can supervise it. The command-line mode accepts one port from `1` to `65535`.
+Esse comando inicia o servidor HTTP P2P usando o catálogo presente no diretório de trabalho atual. O processo permanece em primeiro plano para que possa ser supervisionado por um gerenciador de containers. A porta deve estar entre `1` e `65535`.
 
-## Practical SQL examples
+## Exemplos práticos de SQL
 
-Enter these statements in **Raw mode**. SQL statements should end in a semicolon.
+Digite os comandos a seguir no **Raw mode**. As instruções SQL devem terminar com ponto e vírgula.
 
-### Map local files
+### Mapear arquivos locais
 
 ```sql
 CREATE EXTERNAL TABLE sales
@@ -116,9 +119,9 @@ SHOW TABLES;
 INFO sales;
 ```
 
-Use a `.parquet` extension for Parquet files; other locations are treated as CSV. CSV/Parquet schemas are inferred from the source. For CSV, provide a header row with column names.
+Use a extensão `.parquet` para arquivos Parquet; os demais caminhos são tratados como CSV. Os esquemas CSV/Parquet são inferidos a partir da fonte. Arquivos CSV devem ter uma linha de cabeçalho com os nomes das colunas.
 
-### Query, filter, join, and limit
+### Consultar, filtrar, combinar e limitar resultados
 
 ```sql
 SELECT region, revenue
@@ -132,7 +135,7 @@ FROM sales
 JOIN products ON product_id = id;
 ```
 
-### Use a common table expression (CTE)
+### Usar uma expressão de tabela comum (CTE)
 
 ```sql
 WITH large_sales AS (
@@ -145,9 +148,9 @@ FROM large_sales
 ORDER BY revenue DESC;
 ```
 
-CTEs are materialized for the query by the current execution engine. Query support is a practical subset and should not be treated as complete SQL-standard coverage.
+As CTEs são materializadas durante a consulta pelo mecanismo atual. O suporte SQL é um subconjunto prático e não deve ser considerado uma implementação completa do padrão SQL.
 
-### Create and publish a view
+### Criar e publicar uma view
 
 ```sql
 CREATE VIEW high_value_sales AS
@@ -159,11 +162,11 @@ PUBLISH VIEW high_value_sales;
 SERVE ON 8080;
 ```
 
-The interactive process stays open while the HTTP server runs in a background thread. Published views are listed by `/catalog`; only published views are available through the P2P query endpoint.
+O processo interativo permanece aberto enquanto o servidor HTTP é executado em uma thread em segundo plano. As views publicadas são listadas em `/catalog`; somente elas podem ser acessadas pelo endpoint de consulta P2P.
 
-### Consume a view from another node
+### Consumir uma view de outro nó
 
-On a peer node, register the source node's published view:
+Em um nó peer, registre a view publicada no nó de origem:
 
 ```sql
 CREATE EXTERNAL TABLE remote_high_value_sales
@@ -174,9 +177,9 @@ FROM remote_high_value_sales
 WHERE revenue >= 5000;
 ```
 
-Replace the address, view, and workspace with values reported by the source node. Supported filters are pushed to the source node; `REFRESH TABLE remote_high_value_sales;` can create or update a local cache.
+Substitua o endereço, a view e o workspace pelos valores informados pelo nó de origem. Filtros compatíveis são enviados ao nó de origem; `REFRESH TABLE remote_high_value_sales;` pode criar ou atualizar o cache local.
 
-### Export query results
+### Exportar resultados de consultas
 
 ```sql
 COPY (SELECT region, revenue FROM sales WHERE revenue >= 1000)
@@ -194,9 +197,9 @@ USE analytics;
 SHOW WORKSPACES;
 ```
 
-Tables and views belong to a workspace. `USE` switches the active workspace for subsequent commands and queries.
+Tabelas e views pertencem a um workspace. `USE` altera o workspace ativo para os comandos e consultas seguintes.
 
-### Other useful commands
+### Outros comandos úteis
 
 ```sql
 SHOW TABLES;
@@ -210,26 +213,26 @@ HELP;
 EXIT;
 ```
 
-`DROP TABLE` removes the table mapping from the catalog; it does not delete the source file.
+`DROP TABLE` remove o mapeamento do catálogo; não apaga o arquivo de origem.
 
-## Connect with DBeaver
+## Conectar usando o DBeaver
 
-1. Start the engine in Raw mode and run `SERVE PG ON 5432;`.
-2. In DBeaver, create a connection using the **PostgreSQL** driver.
-3. Connect to host `127.0.0.1`, port `5432`. The active Federated Engine workspace supplies the visible virtual tables.
-4. Use the connection to explore metadata or run supported `SELECT` statements.
+1. Inicie o mecanismo em Raw mode e execute `SERVE PG ON 5432;`.
+2. No DBeaver, crie uma conexão usando o driver **PostgreSQL**.
+3. Conecte-se ao host `127.0.0.1`, porta `5432`. As tabelas virtuais disponíveis correspondem ao workspace ativo no Federated Engine.
+4. Explore os metadados ou execute consultas `SELECT` compatíveis.
 
-The endpoint has no PostgreSQL authentication implementation. Its loopback-only bind is intentional; it is not a secure, remotely accessible database service.
+O endpoint não implementa autenticação PostgreSQL. O vínculo apenas a loopback é intencional: esse serviço não deve ser considerado seguro para acesso remoto.
 
-## Run with Docker
+## Executar com Docker
 
-Build the multi-stage image:
+Compile a imagem multi-stage:
 
 ```bash
 docker build -t federated-engine:latest .
 ```
 
-The default container command is equivalent to starting the HTTP node on port `8080`:
+O comando padrão do container inicia o nó HTTP na porta `8080`:
 
 ```bash
 docker run --rm \
@@ -240,9 +243,9 @@ docker run --rm \
   federated-engine:latest
 ```
 
-The image runs as a non-root user, stores `.federated_catalog.yaml` and cache files under `/data`, and keeps the server in the foreground. Mount source files into the container and refer to their in-container paths (for example, `/data/sales.csv`) when registering them.
+A imagem executa como usuário não-root, mantém `.federated_catalog.yaml` e os arquivos de cache em `/data` e deixa o servidor em primeiro plano. Monte os arquivos de origem no container e use os caminhos internos ao registrá-los (por exemplo, `/data/input/sales.csv`).
 
-To configure the catalog interactively using the same persistent volume:
+Para configurar o catálogo interativamente usando o mesmo volume persistente:
 
 ```bash
 docker run --rm -it \
@@ -253,16 +256,16 @@ docker run --rm -it \
   -c 'exec /usr/local/bin/federated_engine'
 ```
 
-Then register a mounted file, for example:
+Depois, registre um arquivo montado. Por exemplo:
 
 ```sql
 CREATE EXTERNAL TABLE sales LOCATION '/data/input/sales.csv';
 EXIT;
 ```
 
-After configuration, start the normal headless container command. The Docker image exposes the HTTP P2P port only. The interactive PostgreSQL listener currently binds to loopback and is not exposed by this container setup.
+Após configurar o catálogo, inicie o container normalmente em modo headless. A imagem Docker expõe apenas a porta HTTP P2P. O listener PostgreSQL interativo está vinculado a loopback e não é exposto por essa configuração do container.
 
-## Build, test, and release
+## Compilar, testar e publicar
 
 ```bash
 cargo fmt --check
@@ -270,20 +273,20 @@ cargo test
 cargo build --release --locked
 ```
 
-Pushing a version tag such as `v0.1.0` triggers [the release workflow](.github/workflows/release.yml). It builds release binaries on Ubuntu and Windows and attaches them to a GitHub Release.
+Ao enviar uma tag de versão, como `v0.1.0`, o [workflow de release](.github/workflows/release.yml) é executado. Ele compila binários de release no Ubuntu e no Windows e os anexa a uma GitHub Release.
 
-## Limitations and security
+## Limitações e segurança
 
-- SQL support is deliberately limited. Use the examples and the built-in `HELP` command as the supported surface; do not expect full PostgreSQL SQL semantics.
-- The PostgreSQL Wire Protocol endpoint does not implement authentication or full PostgreSQL metadata. It binds to loopback (`127.0.0.1`).
-- The P2P HTTP service and discovery are designed for trusted local networks. HTTP endpoints have no authentication or TLS.
-- Publishing a view makes it queryable by clients that can reach the node. Publish only data you intend to share.
-- Discovery scans private IPv4 subnets, with a bounded host count; container and host networking can affect which interfaces and peers are reachable.
-- Treat external URLs as trusted inputs. Remote data is downloaded or queried according to the selected source and query.
-- The engine is not a durable database or a substitute for access control, backups, or production data governance.
+- O suporte SQL é deliberadamente limitado. Consulte os exemplos e o comando integrado `HELP`; não espere semântica SQL completa do PostgreSQL.
+- O endpoint PostgreSQL Wire Protocol não implementa autenticação nem todos os metadados PostgreSQL. Ele escuta em loopback (`127.0.0.1`).
+- O serviço HTTP P2P e a descoberta foram projetados para redes locais confiáveis. Os endpoints HTTP não oferecem autenticação nem TLS.
+- Publicar uma view permite que clientes capazes de alcançar o nó a consultem. Publique somente dados que você pretende compartilhar.
+- A descoberta percorre sub-redes IPv4 privadas, com limite para a quantidade de hosts. A rede do host e a do container podem afetar as interfaces e os peers acessíveis.
+- Use somente URLs externas confiáveis. Os dados remotos são baixados ou consultados conforme a fonte e a consulta selecionadas.
+- O mecanismo não é um banco de dados durável nem substitui controles de acesso, backups ou governança de dados em produção.
 
-## Contributing
+## Contribuir
 
-Issues and pull requests are welcome. For code changes, include focused tests for behavior changes and run `cargo fmt --check` and `cargo test` before submitting.
+Issues e pull requests são bem-vindos. Para alterações de código, inclua testes focados nas mudanças de comportamento e execute `cargo fmt --check` e `cargo test` antes de enviar sua contribuição.
 
-Before publishing this repository as open source, add a `LICENSE` file with the project's chosen license and ensure all included dependencies, sample data, and other assets can be redistributed under their applicable terms. This repository currently does not declare a project license.
+Antes de publicar este repositório como open source, adicione um arquivo `LICENSE` com a licença escolhida para o projeto e confirme que dependências, dados de exemplo e demais recursos podem ser redistribuídos de acordo com os respectivos termos. No momento, este repositório não declara uma licença para o projeto.
