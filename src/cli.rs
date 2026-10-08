@@ -80,14 +80,9 @@ pub fn run_selectable_mode(
     loop {
         let snapshot = catalog.lock().unwrap().clone();
         let options = [
-            "Consultar dados (assistente SELECT)",
-            "Listar tabelas e views",
-            "Mapear arquivo/URL como tabela externa",
-            "Atualizar cache de tabela remota",
-            "Criar view (assistente SELECT)",
-            "Publicar view na rede",
-            "Descobrir nos na rede local",
-            "Iniciar servidor P2P",
+            "Consultas e views",
+            "Tabelas e arquivos",
+            "Rede e servidores",
             "Gerenciar workspaces",
             "Digitar comando SQL livre",
             "Alternar para raw mode",
@@ -95,82 +90,140 @@ pub fn run_selectable_mode(
         ];
         let workspace = &snapshot.active_workspace;
         let prompt = format!(
-            "Federated Engine | workspace: {} | escolha uma acao",
+            "Federated Engine | workspace: {} | escolha uma categoria",
             workspace
         );
         match choose(&prompt, &options)? {
-            Some(0) => {
-                if let Some(query) = build_select_query(&snapshot)? {
-                    execute_sql(&query, &catalog);
-                }
-            }
-            Some(1) => execute_sql("SHOW TABLES;", &catalog),
-            Some(2) => {
-                if let Some(sql) = map_external_table()? {
-                    execute_sql(&sql, &catalog);
-                }
-            }
-            Some(3) => {
-                let names = snapshot
-                    .workspaces
-                    .get(&snapshot.active_workspace)
-                    .map(|workspace| {
-                        workspace
-                            .tables
-                            .iter()
-                            .filter(|(_, table)| table.source_url.is_some())
-                            .map(|(name, _)| name.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if names.is_empty() {
-                    println!("Nao ha tabelas remotas neste workspace.");
-                } else if let Some(index) = choose("Qual tabela deseja atualizar?", &names)? {
-                    execute_sql(
-                        &format!("REFRESH TABLE {};", quote_identifier(&names[index])),
-                        &catalog,
-                    );
-                }
-            }
+            Some(0) => manage_queries_and_views(&snapshot, &catalog)?,
+            Some(1) => manage_tables_and_files(&snapshot, &catalog)?,
+            Some(2) => manage_network(&snapshot, &catalog)?,
+            Some(3) => manage_workspaces(&snapshot, &catalog)?,
             Some(4) => {
-                if let Some(query) = build_select_query(&snapshot)? {
-                    let name = validate_identifier(&ask_text("Nome da nova view", None)?)?;
-                    execute_sql(&format!("CREATE VIEW {} AS {};", name, query), &catalog);
-                }
-            }
-            Some(5) => {
-                let names = snapshot
-                    .workspaces
-                    .get(&snapshot.active_workspace)
-                    .map(|workspace| workspace.views.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                if names.is_empty() {
-                    println!("Nao ha views neste workspace.");
-                } else if let Some(index) = choose("Qual view deseja publicar?", &names)? {
-                    execute_sql(
-                        &format!("PUBLISH VIEW {};", quote_identifier(&names[index])),
-                        &catalog,
-                    );
-                }
-            }
-            Some(6) => execute_sql("SHOW NETWORK NODES;", &catalog),
-            Some(7) => {
-                let port = ask_text("Porta para servir as views", Some("8080"))?;
-                match port.parse::<u16>() {
-                    Ok(port) if port > 0 => execute_sql(&format!("SERVE ON {};", port), &catalog),
-                    _ => println!("\x1B[1;31mErro:\x1B[0m Informe uma porta entre 1 e 65535."),
-                }
-            }
-            Some(8) => manage_workspaces(&snapshot, &catalog)?,
-            Some(9) => {
                 let sql = ask_text("Comando SQL (termine com ;)", None)?;
                 execute_sql(&sql, &catalog);
             }
-            Some(10) | None => return Ok(Some(super::InterfaceMode::Raw)),
-            Some(11) => return Ok(None),
+            Some(5) | None => return Ok(Some(super::InterfaceMode::Raw)),
+            Some(6) => return Ok(None),
             Some(_) => unreachable!(),
         }
     }
+}
+
+fn manage_queries_and_views(
+    snapshot: &Catalog,
+    catalog: &Arc<Mutex<Catalog>>,
+) -> Result<(), String> {
+    let options = [
+        "Consultar dados (assistente SELECT)",
+        "Criar view (assistente SELECT)",
+        "Voltar",
+    ];
+    match choose("Consultas e views", &options)? {
+        Some(0) => {
+            if let Some(query) = build_select_query(snapshot)? {
+                execute_sql(&query, catalog);
+            }
+        }
+        Some(1) => {
+            if let Some(query) = build_select_query(snapshot)? {
+                let name = validate_identifier(&ask_text("Nome da nova view", None)?)?;
+                execute_sql(&format!("CREATE VIEW {} AS {};", name, query), catalog);
+            }
+        }
+        Some(2) | None => {}
+        Some(_) => unreachable!(),
+    }
+    Ok(())
+}
+
+fn manage_tables_and_files(
+    snapshot: &Catalog,
+    catalog: &Arc<Mutex<Catalog>>,
+) -> Result<(), String> {
+    let options = [
+        "Listar tabelas e views",
+        "Mapear arquivo/URL como tabela externa",
+        "Atualizar cache de tabela remota",
+        "Voltar",
+    ];
+    match choose("Tabelas e arquivos", &options)? {
+        Some(0) => execute_sql("SHOW TABLES;", catalog),
+        Some(1) => {
+            if let Some(sql) = map_external_table()? {
+                execute_sql(&sql, catalog);
+            }
+        }
+        Some(2) => {
+            let names = snapshot
+                .workspaces
+                .get(&snapshot.active_workspace)
+                .map(|workspace| {
+                    workspace
+                        .tables
+                        .iter()
+                        .filter(|(_, table)| table.source_url.is_some())
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if names.is_empty() {
+                println!("Nao ha tabelas remotas neste workspace.");
+            } else if let Some(index) = choose("Qual tabela deseja atualizar?", &names)? {
+                execute_sql(
+                    &format!("REFRESH TABLE {};", quote_identifier(&names[index])),
+                    catalog,
+                );
+            }
+        }
+        Some(3) | None => {}
+        Some(_) => unreachable!(),
+    }
+    Ok(())
+}
+
+fn manage_network(snapshot: &Catalog, catalog: &Arc<Mutex<Catalog>>) -> Result<(), String> {
+    let options = [
+        "Publicar view na rede",
+        "Descobrir nos na rede local",
+        "Iniciar servidor P2P (HTTP)",
+        "Iniciar servidor PostgreSQL",
+        "Voltar",
+    ];
+    match choose("Rede e servidores", &options)? {
+        Some(0) => {
+            let names = snapshot
+                .workspaces
+                .get(&snapshot.active_workspace)
+                .map(|workspace| workspace.views.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if names.is_empty() {
+                println!("Nao ha views neste workspace.");
+            } else if let Some(index) = choose("Qual view deseja publicar?", &names)? {
+                execute_sql(
+                    &format!("PUBLISH VIEW {};", quote_identifier(&names[index])),
+                    catalog,
+                );
+            }
+        }
+        Some(1) => execute_sql("SHOW NETWORK NODES;", catalog),
+        Some(2) => {
+            let port = ask_text("Porta do servidor P2P HTTP", Some("8080"))?;
+            match port.parse::<u16>() {
+                Ok(port) if port > 0 => execute_sql(&format!("SERVE ON {};", port), catalog),
+                _ => println!("\x1B[1;31mErro:\x1B[0m Informe uma porta entre 1 e 65535."),
+            }
+        }
+        Some(3) => {
+            let port = ask_text("Porta do servidor PostgreSQL", Some("5432"))?;
+            match port.parse::<u16>() {
+                Ok(port) if port > 0 => execute_sql(&format!("SERVE PG ON {};", port), catalog),
+                _ => println!("\x1B[1;31mErro:\x1B[0m Informe uma porta entre 1 e 65535."),
+            }
+        }
+        Some(4) | None => {}
+        Some(_) => unreachable!(),
+    }
+    Ok(())
 }
 
 fn map_external_table() -> Result<Option<String>, String> {

@@ -20,6 +20,27 @@ enum InterfaceMode {
 
 #[tokio::main]
 async fn main() {
+    let mut args = std::env::args().skip(1);
+    if let Some(mode) = args.next() {
+        if mode != "--serve-http" {
+            eprintln!("Uso: federated_engine [--serve-http <porta>]");
+            return;
+        }
+        let Some(port) = args.next().and_then(|value| value.parse::<u16>().ok()) else {
+            eprintln!("Uso: federated_engine --serve-http <porta>");
+            return;
+        };
+        if port == 0 || args.next().is_some() {
+            eprintln!("Informe uma porta valida entre 1 e 65535.");
+            return;
+        }
+
+        let catalog = Arc::new(Mutex::new(catalog::Catalog::load()));
+        server::start_server(catalog, port);
+        std::future::pending::<()>().await;
+        return;
+    }
+
     print!("\x1B[2J\x1B[1;1H");
     println!("==================================================");
     println!(" Federated Data Engine - P2P Marketplace");

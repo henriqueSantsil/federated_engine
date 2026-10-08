@@ -18,6 +18,9 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 use std::fmt::Debug;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -120,6 +123,9 @@ async fn execute_query_response(
     if query.trim().trim_matches(';').trim().is_empty() {
         return Ok(Response::Execution(Tag::new("OK")));
     }
+    if let Some(tag) = session_control_tag(query) {
+        return Ok(Response::Execution(Tag::new(tag)));
+    }
 
     if let Some(metadata_batches) = metadata_batches_for_raw_query(query, catalog) {
         let batches = metadata_batches.map_err(|error| user_error("XX000", error))?;
@@ -164,6 +170,9 @@ async fn describe_query_fields(
     catalog: &Arc<Mutex<Catalog>>,
 ) -> PgWireResult<Vec<FieldInfo>> {
     if query.trim().trim_matches(';').trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if session_control_tag(query).is_some() {
         return Ok(Vec::new());
     }
     if let Some(metadata_batches) = metadata_batches_for_raw_query(query, catalog) {
@@ -223,7 +232,13 @@ fn metadata_batches_for_raw_query(
             )))
         }
     };
-    let result = if normalized.contains("pg_namespace") {
+    let result = if normalized.contains("information_schema.tables") {
+        information_schema_tables_batches(&catalog)
+    } else if normalized.contains("information_schema.columns") {
+        information_schema_columns_batches(&catalog)
+    } else if normalized.trim_start().starts_with("show ") {
+        show_setting_batches(query)
+    } else if normalized.contains("pg_namespace") {
         pg_namespace_batches()
     } else if normalized.contains("pg_class") {
         pg_class_batches(&catalog)
@@ -232,7 +247,240 @@ fn metadata_batches_for_raw_query(
     } else {
         metadata_fallback("consulta de sistema/configuracao sem mock especifico")
     };
-    Some(result)
+    Some(result.and_then(|batches| project_metadata_batches(query, batches)))
+}
+
+fn information_schema_tables_batches(catalog: &Catalog) -> Result<Vec<RecordBatch>, String> {
+    let workspace = catalog.workspaces.get(&catalog.active_workspace);
+    let mut relations = workspace
+        .into_iter()
+        .flat_map(|workspace| {
+            workspace
+                .tables
+                .keys()
+                .map(|name| (name.clone(), "BASE TABLE"))
+                .chain(workspace.views.keys().map(|name| (name.clone(), "VIEW")))
+        })
+        .collect::<Vec<_>>();
+    relations.sort_by(|left, right| left.0.cmp(&right.0));
+
+    make_metadata_record_batch(
+        vec![
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("table_type", DataType::Utf8, false),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["federated_engine"; relations.len()])),
+            Arc::new(StringArray::from(vec!["public"; relations.len()])),
+            Arc::new(StringArray::from(
+                relations
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                relations.iter().map(|(_, kind)| *kind).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+}
+
+fn information_schema_columns_batches(catalog: &Catalog) -> Result<Vec<RecordBatch>, String> {
+    let workspace = catalog.workspaces.get(&catalog.active_workspace);
+    let mut columns = workspace
+        .into_iter()
+        .flat_map(|workspace| {
+            workspace
+                .tables
+                .values()
+                .flat_map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, column)| {
+                            (
+                                table.name.clone(),
+                                column.name.clone(),
+                                index as i32 + 1,
+                                column.data_type.clone(),
+                            )
+                        })
+                })
+                .chain(workspace.views.keys().flat_map(|name| {
+                    catalog
+                        .get_view_columns_qualified(name, &catalog.active_workspace)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(index, column)| {
+                            (
+                                name.clone(),
+                                column.name,
+                                index as i32 + 1,
+                                column.data_type,
+                            )
+                        })
+                }))
+        })
+        .collect::<Vec<_>>();
+    columns.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+
+    make_metadata_record_batch(
+        vec![
+            Field::new("table_catalog", DataType::Utf8, false),
+            Field::new("table_schema", DataType::Utf8, false),
+            Field::new("table_name", DataType::Utf8, false),
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("ordinal_position", DataType::Int32, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("is_nullable", DataType::Utf8, false),
+        ],
+        vec![
+            Arc::new(StringArray::from(vec!["federated_engine"; columns.len()])),
+            Arc::new(StringArray::from(vec!["public"; columns.len()])),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|(table, _, _, _)| table.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|(_, name, _, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                columns
+                    .iter()
+                    .map(|(_, _, ordinal, _)| *ordinal)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                columns
+                    .iter()
+                    .map(|(_, _, _, data_type)| data_type.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec!["YES"; columns.len()])),
+        ],
+    )
+}
+
+fn project_metadata_batches(
+    query: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, String> {
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, query) else {
+        return Ok(batches);
+    };
+    let Some(Statement::Query(query)) = statements.first() else {
+        return Ok(batches);
+    };
+    let SetExpr::Select(select) = &*query.body else {
+        return Ok(batches);
+    };
+    let first_batch = batches
+        .first()
+        .ok_or_else(|| "O catalogo nao retornou esquema Arrow.".to_string())?;
+    let first_schema = first_batch.schema();
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_)))
+    {
+        return Ok(batches);
+    }
+
+    let mut projection = Vec::new();
+    for item in &select.projection {
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => return Ok(batches),
+        };
+        let source_name = match expression {
+            Expr::Identifier(identifier) => identifier.value.as_str(),
+            Expr::CompoundIdentifier(identifiers) => {
+                let Some(identifier) = identifiers.last() else {
+                    return Ok(batches);
+                };
+                identifier.value.as_str()
+            }
+            _ => return Ok(batches),
+        };
+        let Some(index) = first_schema
+            .fields()
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case(source_name))
+        else {
+            return Ok(batches);
+        };
+        let field = &first_schema.fields()[index];
+        let output_name = alias.unwrap_or(field.name());
+        projection.push((
+            index,
+            Field::new(output_name, field.data_type().clone(), field.is_nullable()),
+        ));
+    }
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            let schema = Arc::new(Schema::new(
+                projection
+                    .iter()
+                    .map(|(_, field)| field.clone())
+                    .collect::<Vec<_>>(),
+            ));
+            let arrays = projection
+                .iter()
+                .map(|(index, _)| Arc::clone(batch.column(*index)))
+                .collect();
+            RecordBatch::try_new(schema, arrays)
+                .map_err(|error| format!("Falha ao projetar metadados PostgreSQL: {}", error))
+        })
+        .collect()
+}
+
+fn session_control_tag(query: &str) -> Option<&'static str> {
+    let first_keyword = query
+        .trim()
+        .split_whitespace()
+        .next()?
+        .trim_matches(|character: char| !character.is_ascii_alphabetic())
+        .to_ascii_lowercase();
+    match first_keyword.as_str() {
+        "begin" | "start" => Some("BEGIN"),
+        "commit" | "end" => Some("COMMIT"),
+        "rollback" => Some("ROLLBACK"),
+        "set" | "reset" => Some("SET"),
+        "discard" => Some("DISCARD"),
+        _ => None,
+    }
+}
+
+fn show_setting_batches(query: &str) -> Result<Vec<RecordBatch>, String> {
+    let setting = query
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("setting")
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .to_ascii_lowercase();
+    let value = match setting.as_str() {
+        "search_path" => "public",
+        "application_name" => "federated_engine",
+        "server_encoding" | "client_encoding" => "UTF8",
+        "server_version" => "PostgreSQL-compatible Federated Engine",
+        _ => "",
+    };
+    make_metadata_record_batch(
+        vec![Field::new(&setting, DataType::Utf8, false)],
+        vec![Arc::new(StringArray::from(vec![value]))],
+    )
 }
 
 fn pg_namespace_batches() -> Result<Vec<RecordBatch>, String> {
@@ -568,12 +816,6 @@ mod tests {
             "SELECT description FROM pg_shdescription",
             "SELECT description FROM pg_catalog.pg_description",
             "SELECT rolname FROM pg_roles",
-            "SHOW search_path",
-            "SET application_name = 'dbeaver'",
-            "BEGIN",
-            "COMMIT",
-            "DISCARD ALL",
-            "SELECT table_name FROM information_schema.tables",
             "SELECT attname FROM pg_catalog.pg_attribute",
         ] {
             let Response::Query(mut response) =
@@ -586,6 +828,84 @@ mod tests {
             assert_eq!(response.row_schema[0].datatype(), &Type::TEXT);
             assert!(response.data_rows.next().await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn information_schema_exposes_workspace_tables_and_columns() {
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "rainfall".to_string(),
+                VirtualTable {
+                    name: "rainfall".to_string(),
+                    format: "CSV".to_string(),
+                    physical_path: "/missing/rainfall.csv".to_string(),
+                    source_url: None,
+                    columns: vec![crate::catalog::ColumnDef {
+                        name: "amount".to_string(),
+                        data_type: "DOUBLE".to_string(),
+                    }],
+                },
+            );
+        let catalog = Arc::new(Mutex::new(catalog));
+
+        let Response::Query(mut tables) = execute_query_response(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            &catalog,
+        )
+        .await
+        .unwrap() else {
+            panic!("information_schema.tables must return a result set");
+        };
+        assert_eq!(tables.row_schema.len(), 1);
+        assert_eq!(tables.row_schema[0].name(), "table_name");
+        let row = tables.data_rows.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&row.data).contains("rainfall"));
+
+        let Response::Query(mut columns) = execute_query_response(
+            "SELECT column_name, data_type FROM information_schema.columns",
+            &catalog,
+        )
+        .await
+        .unwrap() else {
+            panic!("information_schema.columns must return a result set");
+        };
+        assert_eq!(columns.row_schema.len(), 2);
+        assert_eq!(columns.row_schema[0].name(), "column_name");
+        assert_eq!(columns.row_schema[1].name(), "data_type");
+        let row = columns.data_rows.next().await.unwrap().unwrap();
+        let encoded = String::from_utf8_lossy(&row.data);
+        assert!(encoded.contains("amount"));
+        assert!(encoded.contains("DOUBLE"));
+    }
+
+    #[tokio::test]
+    async fn session_control_statements_do_not_run_as_table_queries() {
+        let catalog = Arc::new(Mutex::new(Catalog::new()));
+        for query in [
+            "SET application_name = 'dbeaver'",
+            "BEGIN",
+            "COMMIT",
+            "DISCARD ALL",
+        ] {
+            assert!(matches!(
+                execute_query_response(query, &catalog).await.unwrap(),
+                Response::Execution(_)
+            ));
+        }
+        let Response::Query(mut response) = execute_query_response("SHOW search_path", &catalog)
+            .await
+            .unwrap()
+        else {
+            panic!("SHOW must return a result set");
+        };
+        assert_eq!(response.row_schema[0].name(), "search_path");
+        let row = response.data_rows.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&row.data).contains("public"));
     }
 
     #[tokio::test]
