@@ -35,6 +35,8 @@ COMANDOS SUPORTADOS - FEDERATED ENGINE
   REFRESH TABLE <tabela>;       -> Atualiza o cache de uma tabela externa HTTP
 
 [ SISTEMA ]
+  MODE TUI;                     -> Alterna para a interface selecionavel
+  MODE RAW;                     -> Mantem a interface de comandos
   CLEAR                         -> Limpa a tela do terminal
   EXIT / QUIT                   -> Encerra o motor
 =========================================================

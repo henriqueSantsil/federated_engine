@@ -179,7 +179,10 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
         if let Some(as_pos) = clean_sql.to_uppercase().find(" AS ") {
             let parts: Vec<&str> = clean_sql[..as_pos].split_whitespace().collect();
             if parts.len() >= 3 {
-                catalog.add_view(parts[2].to_string(), clean_sql[as_pos + 4..].to_string());
+                catalog.add_view(
+                    parts[2].trim_matches('"').trim_matches('\'').to_string(),
+                    clean_sql[as_pos + 4..].to_string(),
+                );
             } else {
                 println!("\x1B[1;31mErro:\x1B[0m Sintaxe incorreta. Use: CREATE VIEW <nome> AS SELECT ...;");
             }
