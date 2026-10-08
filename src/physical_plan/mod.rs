@@ -1301,7 +1301,17 @@ pub fn execute_select_with_ctes(
             if !is_silent {
                 println!("Exportador: Gerando arquivo Parquet -> {}", path);
             }
-            crate::exporters::export_to_parquet(&final_batches, &path);
+            match crate::exporters::export_to_parquet(&final_batches, &path) {
+                Ok(count) if !is_silent => println!(
+                    "\x1B[1;32mSucesso:\x1B[0m {} linhas exportadas para '{}'.",
+                    count, path
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "\x1B[1;31mErro:\x1B[0m Falha ao exportar Parquet '{}': {}",
+                    path, error
+                ),
+            }
         } else {
             if !is_silent {
                 println!("\x1B[1;31mErro:\x1B[0m Formato de exportacao nao suportado.");

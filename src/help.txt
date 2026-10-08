@@ -25,7 +25,8 @@ COMANDOS SUPORTADOS - FEDERATED ENGINE
   SELECT ... JOIN outratabela ON id = id;
   SELECT ... GROUP BY col1;
   SELECT ... ORDER BY col1 DESC;
-  COPY (SELECT ...) TO 'arquivo.csv';
+  COPY (SELECT ...) TO 'arquivo.csv';      -> Exporta o resultado como CSV
+  COPY (SELECT ...) TO 'arquivo.parquet';  -> Exporta o resultado como Parquet
 
 [ MARKETPLACE & P2P (REDE LOCAL) ]
   PUBLISH VIEW <nome>;          -> Expoe uma View local para a rede
