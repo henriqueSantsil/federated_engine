@@ -3,6 +3,7 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
+use std::io::Read;
 
 #[derive(Debug, Clone)]
 pub enum FilterNode {
@@ -38,6 +39,15 @@ pub struct AggregateNode {
     pub func: String,
     pub column: String,
     pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowNode {
+    pub func: String,
+    pub column: String,
+    pub partition_by: Vec<String>,
+    pub alias: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +250,11 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                         let table_name = name.to_string();
                         let path_or_url =
                             location.unwrap_or_else(|| "".to_string()).replace("'", "");
+                        let table_format = if has_parquet_extension(&path_or_url) {
+                            "PARQUET"
+                        } else {
+                            "CSV"
+                        };
                         let mut physical_path = path_or_url.clone();
                         let source_url = if path_or_url.starts_with("http://")
                             || path_or_url.starts_with("https://")
@@ -255,7 +270,8 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                                 "📡 Conectando ao servidor remoto: \x1B[1;36m{}\x1B[0m...",
                                 path_or_url
                             );
-                            let cache_file = format!(".cache_{}.csv", table_name);
+                            let cache_file =
+                                format!(".cache_{}.{}", table_name, table_format.to_lowercase());
                             physical_path = cache_file.clone();
                             if is_p2p_query_url(source_url) {
                                 match ureq::get(source_url).query("schema_only", "true").call() {
@@ -297,7 +313,12 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                                     }
                                 }
                             } else {
-                                if let Err(error) = download_remote_cache(source_url, &cache_file) {
+                                let download_result = if table_format == "PARQUET" {
+                                    download_remote_cache_binary(source_url, &cache_file)
+                                } else {
+                                    download_remote_cache(source_url, &cache_file)
+                                };
+                                if let Err(error) = download_result {
                                     println!("\x1B[1;31mErro de Conexao P2P:\x1B[0m {}", error);
                                     continue;
                                 }
@@ -314,7 +335,12 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                         let mut columns = if let Some(columns) = remote_columns {
                             columns
                         } else {
-                            match crate::connectors::csv::infer_schema(&physical_path) {
+                            let inferred_schema = if table_format == "PARQUET" {
+                                crate::connectors::parquet::infer_schema(&physical_path)
+                            } else {
+                                crate::connectors::csv::infer_schema(&physical_path)
+                            };
+                            match inferred_schema {
                                 Ok(schema) => schema
                                     .fields()
                                     .iter()
@@ -345,7 +371,7 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
 
                         let new_table = VirtualTable {
                             name: table_name.clone(),
-                            format: "CSV".to_string(),
+                            format: table_format.to_string(),
                             physical_path,
                             source_url,
                             columns,
@@ -358,7 +384,13 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                         }
                     }
                     Statement::Query(query) => {
-                        parse_and_execute_query(&query, None, catalog, &catalog.active_workspace);
+                        let _ = parse_and_execute_query(
+                            &query,
+                            None,
+                            catalog,
+                            &catalog.active_workspace,
+                            false,
+                        );
                     }
                     Statement::Copy { source, target, .. } => {
                         let export_path = match target {
@@ -377,6 +409,7 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
                                 Some(export_path),
                                 catalog,
                                 &catalog.active_workspace,
+                                false,
                             );
                         }
                     }
@@ -390,6 +423,28 @@ pub fn parse_command(sql: &str, catalog: &mut Catalog) {
             println!("\x1B[1;31mErro de Sintaxe SQL:\x1B[0m {:?}", e);
         }
     }
+}
+
+pub fn execute_query(
+    sql: &str,
+    catalog: &Catalog,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|error| format!("Erro de sintaxe SQL: {}", error))?;
+    if statements.len() != 1 {
+        return Err("O protocolo PostgreSQL aceita uma consulta por comando.".to_string());
+    }
+    let query = match &statements[0] {
+        Statement::Query(query) => query,
+        _ => return Err("O servidor PostgreSQL suporta consultas SELECT.".to_string()),
+    };
+    Ok(parse_and_execute_query(
+        query,
+        None,
+        catalog,
+        &catalog.active_workspace,
+        true,
+    ))
 }
 
 fn refresh_external_table(table_name: &str, catalog: &mut Catalog) -> Result<(), String> {
@@ -406,8 +461,10 @@ fn refresh_external_table(table_name: &str, catalog: &mut Catalog) -> Result<(),
     let response = ureq::get(source_url)
         .call()
         .map_err(|e| format!("Falha ao baixar a origem '{}': {}", source_url, e))?;
-    let data = response
-        .into_string()
+    let mut data = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut data)
         .map_err(|e| format!("Falha ao ler a resposta da origem: {}", e))?;
     let columns = replace_cache_atomically(&table, &data)?;
     let refreshed_table = VirtualTable { columns, ..table };
@@ -415,9 +472,9 @@ fn refresh_external_table(table_name: &str, catalog: &mut Catalog) -> Result<(),
     catalog.replace_table_qualified(table_name, &active_workspace, refreshed_table)
 }
 
-fn replace_cache_atomically(table: &VirtualTable, data: &str) -> Result<Vec<ColumnDef>, String> {
-    if data.trim().is_empty() {
-        return Err("A origem retornou um CSV vazio.".to_string());
+fn replace_cache_atomically(table: &VirtualTable, data: &[u8]) -> Result<Vec<ColumnDef>, String> {
+    if data.is_empty() {
+        return Err("A origem retornou um arquivo vazio.".to_string());
     }
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -428,7 +485,7 @@ fn replace_cache_atomically(table: &VirtualTable, data: &str) -> Result<Vec<Colu
         std::process::id(),
         duration.as_nanos()
     );
-    if let Err(error) = std::fs::write(&temporary_path, data.as_bytes()) {
+    if let Err(error) = std::fs::write(&temporary_path, data) {
         if let Err(remove_error) = std::fs::remove_file(&temporary_path) {
             if remove_error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
@@ -440,7 +497,7 @@ fn replace_cache_atomically(table: &VirtualTable, data: &str) -> Result<Vec<Colu
         return Err(format!("Falha ao gravar o download temporario: {}", error));
     }
 
-    let inferred_schema = match crate::connectors::csv::infer_schema(&temporary_path) {
+    let inferred_schema = match infer_table_schema(&temporary_path, &table.format) {
         Ok(schema) => schema,
         Err(error) => {
             if let Err(remove_error) = std::fs::remove_file(&temporary_path) {
@@ -485,6 +542,23 @@ fn replace_cache_atomically(table: &VirtualTable, data: &str) -> Result<Vec<Colu
     Ok(columns)
 }
 
+fn infer_table_schema(path: &str, format: &str) -> Result<arrow::datatypes::Schema, String> {
+    if format.eq_ignore_ascii_case("PARQUET") {
+        crate::connectors::parquet::infer_schema(path)
+    } else {
+        crate::connectors::csv::infer_schema(path)
+    }
+}
+
+fn has_parquet_extension(location: &str) -> bool {
+    let path = location.split(['?', '#']).next().unwrap_or(location);
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+        .ends_with(".parquet")
+}
+
 fn is_p2p_query_url(source_url: &str) -> bool {
     source_url
         .split(['?', '#'])
@@ -502,6 +576,22 @@ fn download_remote_cache(source_url: &str, cache_path: &str) -> Result<(), Strin
         .into_string()
         .map_err(|e| format!("Falha ao ler os dados transmitidos pelo servidor: {}", e))?;
     std::fs::write(cache_path, data).map_err(|e| format!("Falha ao criar o cache local: {}", e))
+}
+
+fn download_remote_cache_binary(source_url: &str, cache_path: &str) -> Result<(), String> {
+    let response = ureq::get(source_url)
+        .call()
+        .map_err(|error| format!("Nao foi possivel acessar a origem remota: {}", error))?;
+    let mut reader = response.into_reader();
+    let mut data = Vec::new();
+    reader
+        .read_to_end(&mut data)
+        .map_err(|error| format!("Falha ao ler dados transmitidos pelo servidor: {}", error))?;
+    if data.is_empty() {
+        return Err("A origem remota retornou um arquivo vazio.".to_string());
+    }
+    std::fs::write(cache_path, data)
+        .map_err(|error| format!("Falha ao criar o cache local: {}", error))
 }
 
 fn parse_expr(
@@ -631,7 +721,7 @@ fn parse_expr(
                 _ => return None,
             };
 
-            let (sub_t, sub_p, sub_f, sub_j, _, _, _, _, _, _, _) =
+            let (sub_t, sub_p, sub_f, sub_j, _, _, _, _, _, _, _, _) =
                 extract_query_parts(subquery, catalog, current_ws);
 
             match crate::physical_plan::execute_subquery_for_list(
@@ -668,6 +758,7 @@ fn extract_query_parts(
     Vec<CaseWhenNode>,
     bool,
     Vec<ExtractNode>,
+    Vec<WindowNode>,
 ) {
     let mut table_name = String::new();
     let mut projection = Vec::new();
@@ -680,6 +771,7 @@ fn extract_query_parts(
     let mut cases = Vec::new();
     let mut has_wildcard = false;
     let mut extracts = Vec::new();
+    let mut windows = Vec::new();
 
     if let sqlparser::ast::SetExpr::Select(select) = &*query.body {
         if let Some(table_with_joins) = select.from.first() {
@@ -751,17 +843,89 @@ fn extract_query_parts(
                         {
                             col_name = ident.value.clone();
                         } else if let sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(
+                                sqlparser::ast::Expr::CompoundIdentifier(idents),
+                            ),
+                        ) = arg
+                        {
+                            if let Some(ident) = idents.last() {
+                                col_name = ident.value.clone();
+                            }
+                        } else if let sqlparser::ast::FunctionArg::Unnamed(
                             sqlparser::ast::FunctionArgExpr::Wildcard,
                         ) = arg
                         {
                             col_name = "*".to_string();
                         }
                     }
-                    aggregates.push(AggregateNode {
-                        func: func_name,
-                        column: col_name,
-                        alias,
-                    });
+                    if func.over.is_some() {
+                        let window_spec = match &func.over {
+                            Some(sqlparser::ast::WindowType::WindowSpec(spec)) => Some(spec),
+                            Some(sqlparser::ast::WindowType::NamedWindow(name)) => select
+                                .named_window
+                                .iter()
+                                .find(|definition| {
+                                    definition.0.value.eq_ignore_ascii_case(&name.value)
+                                })
+                                .map(|definition| &definition.1),
+                            None => None,
+                        };
+                        let mut error = if let Some(sqlparser::ast::WindowType::NamedWindow(name)) =
+                            &func.over
+                        {
+                            window_spec.is_none().then(|| {
+                                format!("Janela nomeada '{}' nao foi definida.", name.value)
+                            })
+                        } else {
+                            None
+                        };
+                        if window_spec
+                            .map(|spec| !spec.order_by.is_empty() || spec.window_frame.is_some())
+                            .unwrap_or(false)
+                        {
+                            error = Some(
+                                "ORDER BY e frames em funcoes de janela ainda nao sao suportados."
+                                    .to_string(),
+                            );
+                        }
+                        let partition_exprs = window_spec.map(|spec| &spec.partition_by);
+                        let partition_by = partition_exprs
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|expr| match expr {
+                                sqlparser::ast::Expr::Identifier(ident) => {
+                                    Some(ident.value.clone())
+                                }
+                                sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+                                    idents.last().map(|ident| ident.value.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if partition_exprs.map(Vec::len).unwrap_or(0) != partition_by.len() {
+                            error = Some(
+                                "A funcao de janela possui uma expressao PARTITION BY nao suportada."
+                                    .to_string(),
+                            );
+                        }
+                        let output_name = alias
+                            .clone()
+                            .unwrap_or_else(|| format!("{}({})", func_name, col_name));
+                        windows.push(WindowNode {
+                            func: func_name,
+                            column: col_name,
+                            partition_by,
+                            alias: Some(output_name.clone()),
+                            error,
+                        });
+                        projection.push((output_name, None));
+                    } else {
+                        aggregates.push(AggregateNode {
+                            func: func_name,
+                            column: col_name,
+                            alias,
+                        });
+                    }
                 }
                 sqlparser::ast::Expr::Case {
                     conditions,
@@ -903,6 +1067,7 @@ fn extract_query_parts(
         cases,
         has_wildcard,
         extracts,
+        windows,
     )
 }
 
@@ -911,7 +1076,11 @@ fn parse_and_execute_query(
     export_path: Option<String>,
     catalog: &Catalog,
     current_ws: &str,
-) {
+    return_batches: bool,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    let mut ctes = crate::physical_plan::CteTables::new();
+    materialize_ctes(query, catalog, current_ws, &mut ctes);
+
     let (
         outer_table,
         outer_proj,
@@ -924,6 +1093,7 @@ fn parse_and_execute_query(
         outer_cases,
         outer_wildcard,
         outer_extracts,
+        mut outer_windows,
     ) = extract_query_parts(query, catalog, current_ws);
 
     let mut final_table = outer_table.clone();
@@ -954,6 +1124,7 @@ fn parse_and_execute_query(
                     inner_cases,
                     inner_wildcard,
                     inner_extracts,
+                    inner_windows,
                 ) = extract_query_parts(inner_query, catalog, &view_ws);
 
                 final_table = inner_table;
@@ -985,6 +1156,9 @@ fn parse_and_execute_query(
                 if final_extracts.is_empty() {
                     final_extracts = inner_extracts;
                 }
+                if outer_windows.is_empty() {
+                    outer_windows = inner_windows;
+                }
 
                 if let Some(inner_f) = inner_filter {
                     if let Some(outer_f) = final_filter {
@@ -1004,7 +1178,7 @@ fn parse_and_execute_query(
             let dialect = GenericDialect {};
             if let Ok(ast) = Parser::parse_sql(&dialect, &view_query_str) {
                 if let Some(Statement::Query(inner_query)) = ast.first() {
-                    let (mut inner_table, _, inner_filter, _, _, _, _, _, _, _, _) =
+                    let (mut inner_table, _, inner_filter, _, _, _, _, _, _, _, _, _) =
                         extract_query_parts(inner_query, catalog, current_ws);
                     if !inner_table.contains('.') {
                         inner_table = format!("{}.{}", view_ws, inner_table);
@@ -1016,7 +1190,7 @@ fn parse_and_execute_query(
         }
     }
 
-    crate::physical_plan::execute_select(
+    crate::physical_plan::execute_select_with_ctes(
         &final_table,
         final_proj,
         final_filter,
@@ -1031,7 +1205,42 @@ fn parse_and_execute_query(
         catalog,
         export_path,
         &final_ws,
-    );
+        &ctes,
+        outer_windows,
+        return_batches,
+    )
+}
+
+fn materialize_ctes(
+    query: &sqlparser::ast::Query,
+    catalog: &Catalog,
+    current_ws: &str,
+    ctes: &mut crate::physical_plan::CteTables,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            materialize_ctes(&cte.query, catalog, current_ws, ctes);
+            let (
+                table,
+                projection,
+                filter,
+                join,
+                limit,
+                group_by,
+                aggregates,
+                order_by,
+                cases,
+                wildcard,
+                extracts,
+                windows,
+            ) = extract_query_parts(&cte.query, catalog, current_ws);
+            let rows = crate::physical_plan::execute_select_with_ctes(
+                &table, projection, filter, join, limit, group_by, aggregates, order_by, cases,
+                wildcard, extracts, catalog, None, current_ws, ctes, windows, true,
+            );
+            ctes.insert(cte.alias.name.value.to_ascii_lowercase(), rows);
+        }
+    }
 }
 
 fn is_safe_remote_filter(expr: &sqlparser::ast::Expr) -> bool {
@@ -1122,23 +1331,85 @@ pub fn execute_remote_view_query(
         if !is_safe_remote_filter(selection) {
             return Err("O filtro remoto usa uma expressao nao suportada.".to_string());
         }
-        let (_, _, parsed_filter, _, _, _, _, _, _, _, _) =
+        let (_, _, parsed_filter, _, _, _, _, _, _, _, _, _) =
             extract_query_parts(query, catalog, workspace);
         if parsed_filter.is_none() {
             return Err("Nao foi possivel interpretar o filtro remoto.".to_string());
         }
     }
 
-    parse_and_execute_query(query, Some(export_path), catalog, workspace);
+    let _ = parse_and_execute_query(query, Some(export_path), catalog, workspace, false);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_remote_view_query, replace_cache_atomically};
+    use super::{
+        execute_query, execute_remote_view_query, extract_query_parts, has_parquet_extension,
+        materialize_ctes, replace_cache_atomically,
+    };
     use crate::catalog::{Catalog, ColumnDef, VirtualTable};
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn detects_parquet_extensions_in_paths_and_urls() {
+        assert!(has_parquet_extension("/data/rainfall.PARQUET"));
+        assert!(has_parquet_extension(
+            "https://example.test/rainfall.parquet?token=abc"
+        ));
+        assert!(!has_parquet_extension(
+            "https://example.test/query?view=rainfall"
+        ));
+        assert!(!has_parquet_extension("/data/rainfall.csv"));
+    }
+
+    #[test]
+    fn execute_query_returns_all_rows_without_cli_truncation() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "federated-engine-pg-query-{}-{}.csv",
+            std::process::id(),
+            nonce
+        ));
+        let mut csv = String::from("year\n");
+        for year in 2000..2025 {
+            csv.push_str(&format!("{year}\n"));
+        }
+        fs::write(&path, csv).unwrap();
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "climate".to_string(),
+                VirtualTable {
+                    name: "climate".to_string(),
+                    format: "CSV".to_string(),
+                    physical_path: path.to_string_lossy().into_owned(),
+                    source_url: None,
+                    columns: vec![ColumnDef {
+                        name: "year".to_string(),
+                        data_type: "Int64".to_string(),
+                    }],
+                },
+            );
+
+        let batches = execute_query("SELECT year FROM climate", &catalog).unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            25
+        );
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn remote_view_query_applies_filter_and_exports_all_matching_rows() {
@@ -1242,7 +1513,7 @@ mod tests {
             }],
         };
 
-        let columns = replace_cache_atomically(&table, "year,place\n2024,Sorriso\n").unwrap();
+        let columns = replace_cache_atomically(&table, b"year,place\n2024,Sorriso\n").unwrap();
         assert_eq!(
             fs::read_to_string(&cache_path).unwrap(),
             "year,place\n2024,Sorriso\n"
@@ -1257,8 +1528,337 @@ mod tests {
         assert_eq!(columns[0].data_type, "Int64");
 
         let previous_cache = fs::read_to_string(&cache_path).unwrap();
-        assert!(replace_cache_atomically(&table, "").is_err());
+        assert!(replace_cache_atomically(&table, b"").is_err());
         assert_eq!(fs::read_to_string(&cache_path).unwrap(), previous_cache);
         fs::remove_file(cache_path).unwrap();
+    }
+
+    #[test]
+    fn ctes_materialize_cascading_queries_and_join_on_either_side() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "federated-engine-cte-{}-{}.csv",
+            std::process::id(),
+            nonce
+        ));
+        fs::write(&source_path, "year,place\n2023,Other\n2024,Sorriso\n").unwrap();
+
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "climate".to_string(),
+                VirtualTable {
+                    name: "climate".to_string(),
+                    format: "CSV".to_string(),
+                    physical_path: source_path.to_string_lossy().into_owned(),
+                    source_url: None,
+                    columns: vec![
+                        ColumnDef {
+                            name: "year".to_string(),
+                            data_type: "Int64".to_string(),
+                        },
+                        ColumnDef {
+                            name: "place".to_string(),
+                            data_type: "Utf8".to_string(),
+                        },
+                    ],
+                },
+            );
+
+        let run_query = |sql: &str| {
+            let dialect = GenericDialect {};
+            let statements = Parser::parse_sql(&dialect, sql).unwrap();
+            let Statement::Query(query) = &statements[0] else {
+                panic!("expected query");
+            };
+            let mut ctes = crate::physical_plan::CteTables::new();
+            materialize_ctes(query, &catalog, "default", &mut ctes);
+            let (
+                table,
+                projection,
+                filter,
+                join,
+                limit,
+                group_by,
+                aggregates,
+                order_by,
+                cases,
+                wildcard,
+                extracts,
+                windows,
+            ) = extract_query_parts(query, &catalog, "default");
+            crate::physical_plan::execute_select_with_ctes(
+                &table, projection, filter, join, limit, group_by, aggregates, order_by, cases,
+                wildcard, extracts, &catalog, None, "default", &ctes, windows, true,
+            )
+        };
+
+        let cascaded = run_query(
+            "WITH base AS (SELECT year, place FROM climate), filtered AS \
+             (SELECT year, place FROM base WHERE year = 2024) SELECT * FROM filtered",
+        );
+        assert_eq!(
+            cascaded.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+
+        let cte_on_left = run_query(
+            "WITH picked AS (SELECT year, place FROM climate WHERE year = 2024) \
+             SELECT * FROM picked JOIN climate ON picked.year = climate.year",
+        );
+        assert_eq!(
+            cte_on_left
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            1
+        );
+        assert!(cte_on_left[0]
+            .schema()
+            .field_with_name("place_climate")
+            .is_ok());
+
+        let cte_on_right = run_query(
+            "WITH picked AS (SELECT year, place FROM climate WHERE year = 2024) \
+             SELECT * FROM climate JOIN picked ON climate.year = picked.year",
+        );
+        assert_eq!(
+            cte_on_right
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            1
+        );
+        assert!(cte_on_right[0]
+            .schema()
+            .field_with_name("place_picked")
+            .is_ok());
+
+        fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    fn window_sum_broadcasts_partition_total_without_collapsing_rows() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "federated-engine-window-{}-{}.csv",
+            std::process::id(),
+            nonce
+        ));
+        fs::write(
+            &source_path,
+            "municipality,rain\nSorriso,10\nSorriso,20\nLucas,7\n",
+        )
+        .unwrap();
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "rainfall".to_string(),
+                VirtualTable {
+                    name: "rainfall".to_string(),
+                    format: "CSV".to_string(),
+                    physical_path: source_path.to_string_lossy().into_owned(),
+                    source_url: None,
+                    columns: vec![
+                        ColumnDef {
+                            name: "municipality".to_string(),
+                            data_type: "Utf8".to_string(),
+                        },
+                        ColumnDef {
+                            name: "rain".to_string(),
+                            data_type: "Int64".to_string(),
+                        },
+                    ],
+                },
+            );
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT municipality, rain, SUM(rain) OVER (PARTITION BY municipality) AS total_rain, \
+             AVG(rain) OVER (PARTITION BY municipality) AS avg_rain \
+             FROM rainfall",
+        )
+        .unwrap();
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let (
+            table,
+            projection,
+            filter,
+            join,
+            limit,
+            group_by,
+            aggregates,
+            order_by,
+            cases,
+            wildcard,
+            extracts,
+            windows,
+        ) = super::extract_query_parts(query, &catalog, "default");
+        assert!(aggregates.is_empty());
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].partition_by, vec!["municipality"]);
+
+        let batches = crate::physical_plan::execute_select_with_ctes(
+            &table,
+            projection,
+            filter,
+            join,
+            limit,
+            group_by,
+            aggregates,
+            order_by,
+            cases,
+            wildcard,
+            extracts,
+            &catalog,
+            None,
+            "default",
+            &crate::physical_plan::CteTables::new(),
+            windows,
+            true,
+        );
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 3);
+        let total_idx = result.schema().index_of("total_rain").unwrap();
+        let totals = result
+            .column(total_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        let average_idx = result.schema().index_of("avg_rain").unwrap();
+        let averages = result
+            .column(average_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(totals.value(0), 30.0);
+        assert_eq!(totals.value(1), 30.0);
+        assert_eq!(totals.value(2), 7.0);
+        assert_eq!(averages.value(0), 15.0);
+        assert_eq!(averages.value(1), 15.0);
+        assert_eq!(averages.value(2), 7.0);
+        fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    fn parallel_filter_and_case_projection_process_multiple_csv_batches() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "federated-engine-parallel-{}-{}.csv",
+            std::process::id(),
+            nonce
+        ));
+        let mut csv = String::from("id\n");
+        for id in 0..8192 {
+            csv.push_str(&format!("{id}\n"));
+        }
+        fs::write(&source_path, csv).unwrap();
+
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "records".to_string(),
+                VirtualTable {
+                    name: "records".to_string(),
+                    format: "CSV".to_string(),
+                    physical_path: source_path.to_string_lossy().into_owned(),
+                    source_url: None,
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: "Int64".to_string(),
+                    }],
+                },
+            );
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT id, CASE WHEN id > 4095 THEN 'high' ELSE 'low' END AS band \
+             FROM records WHERE id >= 0",
+        )
+        .unwrap();
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let (
+            table,
+            projection,
+            filter,
+            join,
+            limit,
+            group_by,
+            aggregates,
+            order_by,
+            cases,
+            wildcard,
+            extracts,
+            windows,
+        ) = super::extract_query_parts(query, &catalog, "default");
+        let batches = crate::physical_plan::execute_select_with_ctes(
+            &table,
+            projection,
+            filter,
+            join,
+            limit,
+            group_by,
+            aggregates,
+            order_by,
+            cases,
+            wildcard,
+            extracts,
+            &catalog,
+            None,
+            "default",
+            &crate::physical_plan::CteTables::new(),
+            windows,
+            true,
+        );
+        assert!(
+            batches.len() > 1,
+            "CSV rows should span multiple RecordBatches"
+        );
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            8192
+        );
+
+        let band_idx = batches[0].schema().index_of("band").unwrap();
+        let first_batch_band = batches[0].column(band_idx);
+        let first_values = first_batch_band
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(first_values.value(0), "low");
+
+        let last_batch = batches.last().unwrap();
+        let last_band = last_batch
+            .column(last_batch.schema().index_of("band").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(last_band.value(last_batch.num_rows() - 1), "high");
+        fs::remove_file(source_path).unwrap();
     }
 }

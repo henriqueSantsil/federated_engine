@@ -28,6 +28,25 @@ fn ask_text(prompt: &str, default: Option<&str>) -> Result<String, String> {
 }
 
 fn execute_sql(sql: &str, catalog: &Arc<Mutex<Catalog>>) {
+    if sql.to_uppercase().starts_with("SERVE PG ON ") {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if parts.len() == 4 {
+            match parts[3].trim_end_matches(';').parse::<u16>() {
+                Ok(port) if port > 0 => {
+                    let catalog = catalog.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = crate::pg_server::run(catalog, port).await {
+                            eprintln!("\x1B[1;31mErro no servidor PostgreSQL:\x1B[0m {}", error);
+                        }
+                    });
+                }
+                _ => println!("\x1B[1;31mErro:\x1B[0m Porta invalida."),
+            }
+        } else {
+            println!("\x1B[1;31mErro:\x1B[0m Sintaxe incorreta. Use: SERVE PG ON <porta>;");
+        }
+        return;
+    }
     if sql.to_uppercase().starts_with("SERVE ON ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         if parts.len() == 3 {
@@ -156,7 +175,7 @@ pub fn run_selectable_mode(
 
 fn map_external_table() -> Result<Option<String>, String> {
     let name = validate_identifier(&ask_text("Nome da tabela", None)?)?;
-    let location = ask_text("Caminho CSV ou URL HTTP", None)?;
+    let location = ask_text("Caminho CSV/Parquet ou URL HTTP", None)?;
     Ok(Some(format!(
         "CREATE EXTERNAL TABLE {} LOCATION '{}';",
         name,

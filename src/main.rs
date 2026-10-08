@@ -4,6 +4,7 @@ mod connectors;
 mod exporters;
 mod network_discovery;
 mod parser;
+mod pg_server;
 mod physical_plan;
 mod server;
 
@@ -17,7 +18,8 @@ enum InterfaceMode {
     Selectable,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     print!("\x1B[2J\x1B[1;1H");
     println!("==================================================");
     println!(" Federated Data Engine - P2P Marketplace");
@@ -93,6 +95,30 @@ fn run_raw_mode(
                     } else {
                         println!(
                             "\x1B[1;31mErro:\x1B[0m Sintaxe incorreta. Use: SERVE ON <porta>;"
+                        );
+                    }
+                    continue;
+                }
+                if input.to_uppercase().starts_with("SERVE PG ON ") {
+                    let parts: Vec<&str> = input.split_whitespace().collect();
+                    if parts.len() == 4 {
+                        match parts[3].trim_end_matches(';').parse::<u16>() {
+                            Ok(port) if port > 0 => {
+                                let catalog = catalog_arc.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = pg_server::run(catalog, port).await {
+                                        eprintln!(
+                                            "\x1B[1;31mErro no servidor PostgreSQL:\x1B[0m {}",
+                                            error
+                                        );
+                                    }
+                                });
+                            }
+                            _ => println!("\x1B[1;31mErro:\x1B[0m Porta invalida."),
+                        }
+                    } else {
+                        println!(
+                            "\x1B[1;31mErro:\x1B[0m Sintaxe incorreta. Use: SERVE PG ON <porta>;"
                         );
                     }
                     continue;

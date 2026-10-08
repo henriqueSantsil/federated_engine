@@ -14,3 +14,9 @@ ureq = "2.9"
 if-addrs = "0.13"
 serde_json = "1.0"
 dialoguer = "0.11"
+rayon = "1.10"
+parquet = { version = "53.0.0", features = ["arrow"] }
+pgwire = { version = "0.41.1", default-features = false, features = ["server-api-ring"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+async-trait = "0.1"
+futures = "0.3"

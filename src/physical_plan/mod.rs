@@ -1,5 +1,7 @@
-use crate::catalog::Catalog;
-use crate::parser::{AggregateNode, CaseWhenNode, ExtractNode, FilterNode, JoinInfo, OrderByNode};
+use crate::catalog::{Catalog, VirtualTable};
+use crate::parser::{
+    AggregateNode, CaseWhenNode, ExtractNode, FilterNode, JoinInfo, OrderByNode, WindowNode,
+};
 use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::{
@@ -8,10 +10,14 @@ use arrow::compute::{
 use arrow::csv::reader::{Format, ReaderBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::sync::Arc;
+
+pub type CteTables = HashMap<String, Vec<RecordBatch>>;
 
 fn detect_delimiter(path: &str) -> u8 {
     if let Ok(file) = File::open(path) {
@@ -115,29 +121,85 @@ fn read_csv_batches<R: Read + Seek>(
     file.rewind()
         .map_err(|e| format!("Erro ao reposicionar CSV: {}", e))?;
 
-    let builder = ReaderBuilder::new(Arc::new(schema))
+    let schema = Arc::new(schema);
+    let builder = ReaderBuilder::new(Arc::clone(&schema))
         .with_header(true)
         .with_delimiter(delimiter);
     let csv_reader = builder
         .build(file)
         .map_err(|e| format!("Erro Arrow: {}", e))?;
-    let mut batches = Vec::new();
-
-    for batch_result in csv_reader {
-        let mut batch = batch_result.map_err(|e| format!("Erro ao ler CSV: {}", e))?;
-        if let Some(root_node) = filter_tree {
-            let boolean_mask = evaluate_node(root_node, &batch)
-                .map_err(|e| format!("Erro na filtragem: {}", e))?;
-            batch = filter_record_batch(&batch, &boolean_mask)
-                .map_err(|e| format!("Erro ao aplicar filtro: {}", e))?;
-        }
-        batches.push(batch);
+    let mut batches = csv_reader
+        .map(|batch_result| batch_result.map_err(|e| format!("Erro ao ler CSV: {}", e)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
     }
 
-    Ok(batches)
+    batches
+        .into_par_iter()
+        .map(|batch| {
+            if let Some(root_node) = filter_tree {
+                let boolean_mask = evaluate_node(root_node, &batch)
+                    .map_err(|e| format!("Erro na filtragem: {}", e))?;
+                filter_record_batch(&batch, &boolean_mask)
+                    .map_err(|e| format!("Erro ao aplicar filtro: {}", e))
+            } else {
+                Ok(batch)
+            }
+        })
+        .collect()
 }
 
-fn get_key_as_string(array: &Arc<dyn Array>, row_idx: usize) -> String {
+fn read_parquet_batches(
+    file: File,
+    filter_tree: &Option<FilterNode>,
+) -> Result<Vec<RecordBatch>, String> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| format!("Erro ao abrir arquivo Parquet: {}", error))?;
+    let schema = Arc::clone(builder.schema());
+    let reader = builder
+        .build()
+        .map_err(|error| format!("Erro ao criar leitor Parquet: {}", error))?;
+    let mut batches = reader
+        .map(|result| result.map_err(|error| format!("Erro ao ler Parquet: {}", error)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+
+    batches
+        .into_par_iter()
+        .map(|batch| {
+            if let Some(filter) = filter_tree {
+                let mask = evaluate_node(filter, &batch)
+                    .map_err(|error| format!("Erro na filtragem: {}", error))?;
+                filter_record_batch(&batch, &mask)
+                    .map_err(|error| format!("Erro ao aplicar filtro: {}", error))
+            } else {
+                Ok(batch)
+            }
+        })
+        .collect()
+}
+
+fn read_table_batches(
+    table: &VirtualTable,
+    filter_tree: &Option<FilterNode>,
+) -> Result<Vec<RecordBatch>, String> {
+    let file = File::open(&table.physical_path).map_err(|error| {
+        format!(
+            "Erro ao abrir arquivo da tabela '{}': {}",
+            table.name, error
+        )
+    })?;
+    if table.format.eq_ignore_ascii_case("PARQUET") {
+        read_parquet_batches(file, filter_tree)
+    } else {
+        read_csv_batches(file, detect_delimiter(&table.physical_path), filter_tree)
+    }
+}
+
+pub(crate) fn get_key_as_string(array: &Arc<dyn Array>, row_idx: usize) -> String {
     if array.is_null(row_idx) {
         return "NULL".to_string();
     }
@@ -324,24 +386,45 @@ fn evaluate_node(node: &FilterNode, batch: &RecordBatch) -> Result<BooleanArray,
     }
 }
 
+fn apply_filter_to_batches(
+    batches: Vec<RecordBatch>,
+    filter_tree: &Option<FilterNode>,
+) -> Result<Vec<RecordBatch>, String> {
+    batches
+        .into_par_iter()
+        .map(|batch| {
+            let batch = if let Some(filter) = filter_tree {
+                let mask = evaluate_node(filter, &batch)?;
+                filter_record_batch(&batch, &mask)
+                    .map_err(|error| format!("Erro ao filtrar CTE em memoria: {}", error))?
+            } else {
+                batch
+            };
+            Ok(batch)
+        })
+        .collect::<Result<Vec<_>, String>>()
+}
+
 fn fetch_and_filter_batches(
     table_name: &str,
     filter_tree: &Option<FilterNode>,
     join_info: &Option<JoinInfo>,
     catalog: &Catalog,
     current_ws: &str,
+    ctes: &CteTables,
 ) -> Result<Vec<RecordBatch>, String> {
-    let table = catalog
-        .get_table_qualified(table_name, current_ws)
-        .ok_or_else(|| format!("Tabela '{}' nao existe.", table_name))?;
-
-    let use_remote_source = table
-        .source_url
-        .as_deref()
-        .map(is_p2p_query_endpoint)
-        .unwrap_or(false)
-        && (filter_tree.is_some() || !std::path::Path::new(&table.physical_path).exists());
-    let batches =
+    let mut batches = if let Some(cte_batches) = ctes.get(&table_name.to_ascii_lowercase()) {
+        apply_filter_to_batches(cte_batches.clone(), filter_tree)?
+    } else {
+        let table = catalog
+            .get_table_qualified(table_name, current_ws)
+            .ok_or_else(|| format!("Tabela '{}' nao existe.", table_name))?;
+        let use_remote_source = table
+            .source_url
+            .as_deref()
+            .map(is_p2p_query_endpoint)
+            .unwrap_or(false)
+            && (filter_tree.is_some() || !std::path::Path::new(&table.physical_path).exists());
         if let Some(source_url) = table.source_url.as_deref().filter(|_| use_remote_source) {
             let mut request = ureq::get(source_url);
             if let Some(filter) = filter_tree {
@@ -353,171 +436,127 @@ fn fetch_and_filter_batches(
             let content = response
                 .into_string()
                 .map_err(|e| format!("Erro ao ler os dados retornados pelo nó remoto: {}", e))?;
-            let delimiter = detect_delimiter_from_content(&content);
-            read_csv_batches(Cursor::new(content.into_bytes()), delimiter, filter_tree)?
+            read_csv_batches(
+                Cursor::new(content.clone().into_bytes()),
+                detect_delimiter_from_content(&content),
+                filter_tree,
+            )?
         } else {
-            let file = File::open(&table.physical_path)
-                .map_err(|e| format!("Erro ao abrir arquivo: {}", e))?;
-            read_csv_batches(file, detect_delimiter(&table.physical_path), filter_tree)?
-        };
+            read_table_batches(table, filter_tree)?
+        }
+    };
 
     if let Some(join) = join_info {
-        if let Some(right_table_def) = catalog.get_table_qualified(&join.right_table, current_ws) {
-            if let Ok(mut right_file) = File::open(&right_table_def.physical_path) {
-                let right_delim = detect_delimiter(&right_table_def.physical_path);
-                let right_format = Format::default()
-                    .with_header(true)
-                    .with_delimiter(right_delim);
-
-                if let Ok((right_schema, _)) = right_format.infer_schema(&mut right_file, Some(100))
-                {
-                    let _ = right_file.rewind();
-                    let right_builder = ReaderBuilder::new(Arc::new(right_schema))
-                        .with_header(true)
-                        .with_delimiter(right_delim);
-
-                    if let Ok(right_reader) = right_builder.build(right_file) {
-                        let mut right_batches_raw = Vec::new();
-                        for rb in right_reader {
-                            if let Ok(mut b) = rb {
-                                if let Some(ref r_filter) = join.right_filter {
-                                    match evaluate_node(r_filter, &b) {
-                                        Ok(boolean_mask) => {
-                                            if let Ok(filtered) =
-                                                filter_record_batch(&b, &boolean_mask)
-                                            {
-                                                b = filtered;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            return Err(format!(
-                                                "Erro na filtragem da View (JOIN): {}",
-                                                e
-                                            ))
-                                        }
-                                    }
-                                }
-                                if b.num_rows() > 0 {
-                                    right_batches_raw.push(b);
-                                }
-                            }
-                        }
-
-                        if !right_batches_raw.is_empty() {
-                            let right_schema_ref = right_batches_raw[0].schema();
-                            if let Ok(right_batch) =
-                                concat_batches(&right_schema_ref, &right_batches_raw)
-                            {
-                                if let Ok(right_col_idx) =
-                                    right_batch.schema().index_of(&join.right_column)
-                                {
-                                    let right_col = right_batch.column(right_col_idx);
-                                    let right_str_col = cast(right_col, &DataType::Utf8)
-                                        .unwrap_or_else(|_| right_col.clone());
-                                    let mut right_map = HashMap::new();
-
-                                    for i in 0..right_batch.num_rows() {
-                                        let key = get_key_as_string(&right_str_col, i);
-                                        right_map.insert(key, i as u32);
-                                    }
-
-                                    let mut joined_batches = Vec::new();
-                                    for left_batch in batches {
-                                        if let Ok(left_col_idx) =
-                                            left_batch.schema().index_of(&join.left_column)
-                                        {
-                                            let left_col = left_batch.column(left_col_idx);
-                                            let left_str_col = cast(left_col, &DataType::Utf8)
-                                                .unwrap_or_else(|_| left_col.clone());
-                                            let mut left_indices = Vec::new();
-                                            let mut right_indices = Vec::new();
-
-                                            for i in 0..left_batch.num_rows() {
-                                                let key = get_key_as_string(&left_str_col, i);
-                                                if let Some(&r_idx) = right_map.get(&key) {
-                                                    left_indices.push(i as u32);
-                                                    right_indices.push(r_idx);
-                                                }
-                                            }
-
-                                            if left_indices.is_empty() {
-                                                continue;
-                                            }
-
-                                            let left_take = UInt32Array::from(left_indices);
-                                            let right_take = UInt32Array::from(right_indices);
-
-                                            let mut new_columns = Vec::new();
-                                            let mut new_fields: Vec<Arc<Field>> = Vec::new();
-
-                                            for (i, field) in
-                                                left_batch.schema().fields().iter().enumerate()
-                                            {
-                                                new_fields.push(field.clone());
-                                                new_columns.push(
-                                                    take(left_batch.column(i), &left_take, None)
-                                                        .unwrap(),
-                                                );
-                                            }
-
-                                            for (i, field) in
-                                                right_batch.schema().fields().iter().enumerate()
-                                            {
-                                                if field.name() == &join.right_column {
-                                                    continue;
-                                                }
-                                                let new_name = if left_batch
-                                                    .schema()
-                                                    .field_with_name(field.name())
-                                                    .is_ok()
-                                                {
-                                                    format!(
-                                                        "{}_{}",
-                                                        field.name(),
-                                                        join.right_table
-                                                            .split('.')
-                                                            .last()
-                                                            .unwrap_or(&join.right_table)
-                                                    )
-                                                } else {
-                                                    field.name().clone()
-                                                };
-
-                                                let new_field = Field::new(
-                                                    &new_name,
-                                                    field.data_type().clone(),
-                                                    field.is_nullable(),
-                                                );
-                                                new_fields.push(Arc::new(new_field));
-                                                new_columns.push(
-                                                    take(right_batch.column(i), &right_take, None)
-                                                        .unwrap(),
-                                                );
-                                            }
-
-                                            if let Ok(joined_batch) = RecordBatch::try_new(
-                                                Arc::new(Schema::new(new_fields)),
-                                                new_columns,
-                                            ) {
-                                                joined_batches.push(joined_batch);
-                                            }
-                                        }
-                                    }
-                                    return Ok(joined_batches);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                return Err(format!(
-                    "JOIN ignorado. A tabela base da direita '{}' nao existe.",
-                    join.right_table
-                ));
-            }
-        }
+        let right_batches = if let Some(cte_batches) =
+            ctes.get(&join.right_table.to_ascii_lowercase())
+        {
+            apply_filter_to_batches(cte_batches.clone(), &join.right_filter)?
+        } else if let Some(right_table) = catalog.get_table_qualified(&join.right_table, current_ws)
+        {
+            read_table_batches(right_table, &join.right_filter)?
+        } else {
+            return Err(format!(
+                "Tabela ou CTE do lado direito '{}' nao encontrada.",
+                join.right_table
+            ));
+        };
+        batches = join_record_batches(batches, right_batches, join)?;
     }
     Ok(batches)
+}
+
+fn join_record_batches(
+    batches: Vec<RecordBatch>,
+    right_batches: Vec<RecordBatch>,
+    join: &JoinInfo,
+) -> Result<Vec<RecordBatch>, String> {
+    if right_batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let right_schema = right_batches[0].schema();
+    let right_batch = concat_batches(&right_schema, &right_batches)
+        .map_err(|error| format!("Falha ao consolidar resultados da CTE JOIN: {}", error))?;
+    let right_col_idx = right_batch
+        .schema()
+        .index_of(&join.right_column)
+        .map_err(|_| format!("Coluna '{}' nao encontrada na CTE JOIN.", join.right_column))?;
+    let right_col = right_batch.column(right_col_idx);
+    let right_str_col = cast(right_col, &DataType::Utf8).unwrap_or_else(|_| right_col.clone());
+    let mut right_map = HashMap::new();
+    for i in 0..right_batch.num_rows() {
+        right_map.insert(get_key_as_string(&right_str_col, i), i as u32);
+    }
+
+    let mut joined_batches = Vec::new();
+    for left_batch in batches {
+        let left_col_idx = left_batch
+            .schema()
+            .index_of(&join.left_column)
+            .map_err(|_| {
+                format!(
+                    "Coluna '{}' nao encontrada na tabela base do JOIN.",
+                    join.left_column
+                )
+            })?;
+        let left_col = left_batch.column(left_col_idx);
+        let left_str_col = cast(left_col, &DataType::Utf8).unwrap_or_else(|_| left_col.clone());
+        let mut left_indices = Vec::new();
+        let mut right_indices = Vec::new();
+        for i in 0..left_batch.num_rows() {
+            if let Some(&right_index) = right_map.get(&get_key_as_string(&left_str_col, i)) {
+                left_indices.push(i as u32);
+                right_indices.push(right_index);
+            }
+        }
+        if left_indices.is_empty() {
+            continue;
+        }
+
+        let left_take = UInt32Array::from(left_indices);
+        let right_take = UInt32Array::from(right_indices);
+        let mut fields: Vec<Arc<Field>> = Vec::new();
+        let mut columns = Vec::new();
+        for (index, field) in left_batch.schema().fields().iter().enumerate() {
+            fields.push(field.clone());
+            columns.push(
+                take(left_batch.column(index), &left_take, None).map_err(|error| {
+                    format!("Falha ao projetar tabela esquerda do JOIN: {}", error)
+                })?,
+            );
+        }
+        for (index, field) in right_batch.schema().fields().iter().enumerate() {
+            if field.name() == &join.right_column {
+                continue;
+            }
+            let name = if left_batch.schema().field_with_name(field.name()).is_ok() {
+                format!(
+                    "{}_{}",
+                    field.name(),
+                    join.right_table
+                        .split('.')
+                        .last()
+                        .unwrap_or(&join.right_table)
+                )
+            } else {
+                field.name().clone()
+            };
+            fields.push(Arc::new(Field::new(
+                &name,
+                field.data_type().clone(),
+                field.is_nullable(),
+            )));
+            columns.push(
+                take(right_batch.column(index), &right_take, None).map_err(|error| {
+                    format!("Falha ao projetar tabela direita do JOIN: {}", error)
+                })?,
+            );
+        }
+        joined_batches.push(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .map_err(|error| format!("Falha ao montar resultado do JOIN: {}", error))?,
+        );
+    }
+    Ok(joined_batches)
 }
 
 pub fn execute_subquery_for_list(
@@ -528,8 +567,14 @@ pub fn execute_subquery_for_list(
     catalog: &Catalog,
     current_ws: &str,
 ) -> Result<Vec<String>, String> {
-    let batches =
-        fetch_and_filter_batches(table_name, filter_tree, join_info, catalog, current_ws)?;
+    let batches = fetch_and_filter_batches(
+        table_name,
+        filter_tree,
+        join_info,
+        catalog,
+        current_ws,
+        &CteTables::new(),
+    )?;
     let mut results = Vec::new();
     if projection.is_empty() {
         return Ok(results);
@@ -681,24 +726,224 @@ pub fn execute_select(
     catalog: &Catalog,
     export_path: Option<String>,
     current_ws: &str,
-) {
-    let mut batches =
-        match fetch_and_filter_batches(table_name, &filter_tree, &join_info, catalog, current_ws) {
-            Ok(b) => b,
-            Err(e) => {
-                println!("\x1B[1;31mErro de Execucao:\x1B[0m {}", e);
-                return;
-            }
+) -> Vec<RecordBatch> {
+    execute_select_with_ctes(
+        table_name,
+        projection,
+        filter_tree,
+        join_info,
+        limit,
+        group_by,
+        aggregates,
+        order_by_info,
+        cases,
+        has_wildcard,
+        extracts,
+        catalog,
+        export_path,
+        current_ws,
+        &CteTables::new(),
+        Vec::new(),
+        false,
+    )
+}
+
+fn apply_window_functions(
+    batches: Vec<RecordBatch>,
+    windows: &[WindowNode],
+) -> Result<Vec<RecordBatch>, String> {
+    if windows.is_empty() || batches.is_empty() {
+        return Ok(batches);
+    }
+
+    let schema = batches[0].schema();
+    let mut batch = concat_batches(&schema, &batches)
+        .map_err(|error| format!("Falha ao consolidar lotes para funcao de janela: {}", error))?;
+    for window in windows {
+        if let Some(error) = &window.error {
+            return Err(error.clone());
+        }
+        if !matches!(
+            window.func.as_str(),
+            "SUM" | "AVG" | "COUNT" | "MIN" | "MAX"
+        ) {
+            return Err(format!("Funcao de janela '{}' nao suportada.", window.func));
+        }
+        let mut partition_arrays = Vec::with_capacity(window.partition_by.len());
+        for partition_column in &window.partition_by {
+            let index = batch.schema().index_of(partition_column).map_err(|_| {
+                format!(
+                    "Coluna de particao '{}' nao encontrada na funcao de janela.",
+                    partition_column
+                )
+            })?;
+            partition_arrays.push(batch.column(index).clone());
+        }
+
+        let value_array = if window.column == "*" {
+            None
+        } else {
+            let index = batch.schema().index_of(&window.column).map_err(|_| {
+                format!(
+                    "Coluna '{}' nao encontrada na funcao de janela.",
+                    window.column
+                )
+            })?;
+            Some(batch.column(index).clone())
         };
 
-    if !extracts.is_empty() {
-        let mut new_batches = Vec::new();
-        for batch in batches {
-            let mut new_fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
-            let mut new_columns: Vec<Arc<dyn Array>> = batch.columns().iter().cloned().collect();
+        let mut row_keys = Vec::with_capacity(batch.num_rows());
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for row in 0..batch.num_rows() {
+            let mut key = String::new();
+            for array in &partition_arrays {
+                let value = get_key_as_string(array, row);
+                key.push_str(&format!("{}:{value};", value.len()));
+            }
+            groups.entry(key.clone()).or_default().push(row);
+            row_keys.push(key);
+        }
 
-            for ext in &extracts {
-                if let Ok(col_idx) = batch.schema().index_of(&ext.column) {
+        let output_name = window
+            .alias
+            .clone()
+            .unwrap_or_else(|| format!("{}({})", window.func, window.column));
+        let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+        let mut columns: Vec<Arc<dyn Array>> = batch.columns().iter().cloned().collect();
+
+        if window.func == "COUNT" {
+            let mut group_values = HashMap::new();
+            for (key, rows) in &groups {
+                let count = rows
+                    .iter()
+                    .filter(|&&row| {
+                        value_array
+                            .as_ref()
+                            .map(|array| !array.is_null(row))
+                            .unwrap_or(true)
+                    })
+                    .count() as i64;
+                group_values.insert(key, count);
+            }
+            let values = row_keys
+                .iter()
+                .map(|key| group_values[key])
+                .collect::<Vec<_>>();
+            fields.push(Arc::new(Field::new(&output_name, DataType::Int64, false)));
+            columns.push(Arc::new(Int64Array::from(values)) as Arc<dyn Array>);
+        } else {
+            let array = value_array.as_ref().ok_or_else(|| {
+                format!(
+                    "A funcao de janela '{}' exige uma coluna numerica.",
+                    window.func
+                )
+            })?;
+            let mut group_values = HashMap::new();
+            for (key, rows) in &groups {
+                let mut sum = 0.0;
+                let mut count = 0usize;
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for &row in rows {
+                    if array.is_null(row) {
+                        continue;
+                    }
+                    if let Ok(value) = get_key_as_string(array, row).parse::<f64>() {
+                        sum += value;
+                        min = min.min(value);
+                        max = max.max(value);
+                        count += 1;
+                    }
+                }
+                let result = match window.func.as_str() {
+                    "SUM" => sum,
+                    "AVG" => {
+                        if count == 0 {
+                            0.0
+                        } else {
+                            sum / count as f64
+                        }
+                    }
+                    "MIN" => {
+                        if count == 0 {
+                            0.0
+                        } else {
+                            min
+                        }
+                    }
+                    "MAX" => {
+                        if count == 0 {
+                            0.0
+                        } else {
+                            max
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                group_values.insert(key, result);
+            }
+            let values = row_keys
+                .iter()
+                .map(|key| group_values[key])
+                .collect::<Vec<_>>();
+            fields.push(Arc::new(Field::new(&output_name, DataType::Float64, false)));
+            columns.push(Arc::new(Float64Array::from(values)) as Arc<dyn Array>);
+        }
+        batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| format!("Falha ao adicionar coluna de janela: {}", error))?;
+    }
+
+    Ok(vec![batch])
+}
+
+pub fn execute_select_with_ctes(
+    table_name: &str,
+    projection: Vec<(String, Option<String>)>,
+    filter_tree: Option<FilterNode>,
+    join_info: Option<JoinInfo>,
+    limit: Option<usize>,
+    group_by: Vec<String>,
+    aggregates: Vec<AggregateNode>,
+    order_by_info: Option<OrderByNode>,
+    cases: Vec<CaseWhenNode>,
+    has_wildcard: bool,
+    extracts: Vec<ExtractNode>,
+    catalog: &Catalog,
+    export_path: Option<String>,
+    current_ws: &str,
+    ctes: &CteTables,
+    windows: Vec<WindowNode>,
+    materialize: bool,
+) -> Vec<RecordBatch> {
+    let mut batches = match fetch_and_filter_batches(
+        table_name,
+        &filter_tree,
+        &join_info,
+        catalog,
+        current_ws,
+        ctes,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("\x1B[1;31mErro de Execucao:\x1B[0m {}", e);
+            return Vec::new();
+        }
+    };
+
+    if !extracts.is_empty() {
+        let extracted_result = batches
+            .into_par_iter()
+            .map(|batch| -> Result<RecordBatch, String> {
+                let mut new_fields: Vec<Arc<Field>> =
+                    batch.schema().fields().iter().cloned().collect();
+                let mut new_columns: Vec<Arc<dyn Array>> =
+                    batch.columns().iter().cloned().collect();
+
+                for ext in &extracts {
+                    let col_idx = batch
+                        .schema()
+                        .index_of(&ext.column)
+                        .map_err(|_| format!("Coluna de data '{}' nao encontrada.", ext.column))?;
                     let array = batch.column(col_idx);
                     let str_array = cast(array, &DataType::Utf8).unwrap_or_else(|_| array.clone());
                     let mut extracted_vals = Vec::with_capacity(batch.num_rows());
@@ -725,24 +970,23 @@ pub fn execute_select(
                         }
                     }
 
-                    let ext_col_name = ext.alias.as_ref().unwrap();
+                    let ext_col_name = ext.alias.as_deref().ok_or_else(|| {
+                        format!("Alias nao definido para EXTRACT de '{}'.", ext.column)
+                    })?;
                     new_fields.push(Arc::new(Field::new(ext_col_name, DataType::Int64, true)));
                     new_columns.push(Arc::new(Int64Array::from(extracted_vals)) as Arc<dyn Array>);
-                } else {
-                    println!(
-                        "\x1B[1;31mErro:\x1B[0m Coluna de data '{}' nao encontrada.",
-                        ext.column
-                    );
-                    return;
                 }
-            }
-            if let Ok(new_batch) =
                 RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)
-            {
-                new_batches.push(new_batch);
+                    .map_err(|error| format!("Erro ao adicionar coluna EXTRACT: {}", error))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        batches = match extracted_result {
+            Ok(batches) => batches,
+            Err(error) => {
+                println!("\x1B[1;31mErro no EXTRACT:\x1B[0m {}", error);
+                return Vec::new();
             }
         }
-        batches = new_batches;
     }
 
     if !group_by.is_empty() || !aggregates.is_empty() {
@@ -764,7 +1008,7 @@ pub fn execute_select(
                             "\x1B[1;31mErro:\x1B[0m Coluna de agrupamento '{}' nao encontrada.",
                             col_name
                         );
-                        return;
+                        return Vec::new();
                     }
                 }
 
@@ -886,7 +1130,7 @@ pub fn execute_select(
                                 "\x1B[1;31mErro:\x1B[0m Coluna numerica '{}' nao encontrada.",
                                 agg.column
                             );
-                            return;
+                            return Vec::new();
                         }
                     }
                 }
@@ -902,76 +1146,85 @@ pub fn execute_select(
         }
     }
 
-    let mut projected_batches = Vec::new();
-    if group_by.is_empty() && aggregates.is_empty() {
-        for batch in batches {
-            if !projection.is_empty() || !cases.is_empty() || has_wildcard {
-                let mut new_fields: Vec<Arc<Field>> = Vec::new();
-                let mut new_columns = Vec::new();
-                let schema = batch.schema();
+    match apply_window_functions(batches, &windows) {
+        Ok(window_batches) => batches = window_batches,
+        Err(error) => {
+            println!("\x1B[1;31mErro nas funcoes de janela:\x1B[0m {}", error);
+            return Vec::new();
+        }
+    }
 
-                if has_wildcard {
-                    for i in 0..schema.fields().len() {
-                        new_fields.push(Arc::new(schema.field(i).clone()));
-                        new_columns.push(batch.column(i).clone());
-                    }
-                } else {
-                    for (col_name, alias) in &projection {
-                        if let Ok(idx) = schema.index_of(col_name) {
-                            let original_field = schema.field(idx);
-                            let final_name = alias.clone().unwrap_or_else(|| col_name.clone());
-                            new_fields.push(Arc::new(Field::new(
-                                &final_name,
-                                original_field.data_type().clone(),
-                                original_field.is_nullable(),
-                            )));
-                            new_columns.push(batch.column(idx).clone());
-                        } else {
-                            println!(
-                                "\x1B[1;31mErro:\x1B[0m Coluna '{}' nao existe no esquema.",
-                                col_name
-                            );
-                            return;
+    let projected_batches = if group_by.is_empty() && aggregates.is_empty() {
+        let projected_result = batches
+            .into_par_iter()
+            .map(|batch| -> Result<RecordBatch, String> {
+                if !projection.is_empty() || !cases.is_empty() || has_wildcard {
+                    let mut new_fields: Vec<Arc<Field>> = Vec::new();
+                    let mut new_columns = Vec::new();
+                    let schema = batch.schema();
+
+                    if has_wildcard {
+                        for i in 0..schema.fields().len() {
+                            new_fields.push(Arc::new(schema.field(i).clone()));
+                            new_columns.push(batch.column(i).clone());
+                        }
+                    } else {
+                        for (col_name, alias) in &projection {
+                            if let Ok(idx) = schema.index_of(col_name) {
+                                let original_field = schema.field(idx);
+                                let final_name = alias.clone().unwrap_or_else(|| col_name.clone());
+                                new_fields.push(Arc::new(Field::new(
+                                    &final_name,
+                                    original_field.data_type().clone(),
+                                    original_field.is_nullable(),
+                                )));
+                                new_columns.push(batch.column(idx).clone());
+                            } else {
+                                return Err(format!(
+                                    "Coluna '{}' nao existe no esquema.",
+                                    col_name
+                                ));
+                            }
                         }
                     }
-                }
 
-                for case in &cases {
-                    let mask = match evaluate_node(&case.condition, &batch) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            println!("\x1B[1;31mErro no CASE WHEN:\x1B[0m {}", e);
-                            return;
+                    for case in &cases {
+                        let mask = evaluate_node(&case.condition, &batch)
+                            .map_err(|error| format!("Erro no CASE WHEN: {}", error))?;
+                        let mut case_results = Vec::with_capacity(batch.num_rows());
+                        for i in 0..batch.num_rows() {
+                            if mask.is_null(i) || !mask.value(i) {
+                                case_results.push(case.else_result.as_str());
+                            } else {
+                                case_results.push(case.then_result.as_str());
+                            }
                         }
-                    };
-                    let mut case_results = Vec::with_capacity(batch.num_rows());
-                    for i in 0..batch.num_rows() {
-                        if mask.is_null(i) || !mask.value(i) {
-                            case_results.push(case.else_result.as_str());
-                        } else {
-                            case_results.push(case.then_result.as_str());
-                        }
+                        let case_col_name = case
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| "case_result".to_string());
+                        new_fields.push(Arc::new(Field::new(&case_col_name, DataType::Utf8, true)));
+                        new_columns
+                            .push(Arc::new(StringArray::from(case_results)) as Arc<dyn Array>);
                     }
-                    let case_col_name = case
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| "case_result".to_string());
-                    new_fields.push(Arc::new(Field::new(&case_col_name, DataType::Utf8, true)));
-                    new_columns.push(Arc::new(StringArray::from(case_results)) as Arc<dyn Array>);
-                }
 
-                if let Ok(projected) =
                     RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_columns)
-                {
-                    projected_batches.push(projected);
+                        .map_err(|error| format!("Erro ao projetar RecordBatch: {}", error))
+                } else {
+                    Ok(batch)
                 }
-            } else {
-                projected_batches.push(batch);
+            })
+            .collect::<Result<Vec<_>, _>>();
+        match projected_result {
+            Ok(batches) => batches,
+            Err(error) => {
+                println!("\x1B[1;31mErro na projecao:\x1B[0m {}", error);
+                return Vec::new();
             }
         }
     } else {
-        projected_batches = batches;
-    }
+        batches
+    };
     let mut batches = projected_batches;
 
     if let Some(order) = order_by_info {
@@ -1001,17 +1254,17 @@ pub fn execute_select(
                             "\x1B[1;31mErro:\x1B[0m Falha ao ordenar os dados pela coluna '{}'.",
                             order.column
                         );
-                        return;
+                        return Vec::new();
                     }
                 } else {
                     println!("\x1B[1;31mErro:\x1B[0m Coluna de ordenacao '{}' nao encontrada no resultado.", order.column);
-                    return;
+                    return Vec::new();
                 }
             }
         }
     }
 
-    let max_rows = limit.unwrap_or(if export_path.is_some() {
+    let max_rows = limit.unwrap_or(if materialize || export_path.is_some() {
         usize::MAX
     } else {
         15
@@ -1030,6 +1283,10 @@ pub fn execute_select(
         limited_batches.push(batch);
     }
     let final_batches = limited_batches;
+
+    if materialize {
+        return final_batches;
+    }
 
     if let Some(path) = export_path {
         let is_silent = path.contains(".temp_net_");
@@ -1057,12 +1314,21 @@ pub fn execute_select(
         );
         print_custom_table(&final_batches);
     }
+    final_batches
 }
 
 #[cfg(test)]
 mod tests {
-    use super::filter_to_sql;
+    use super::{fetch_and_filter_batches, filter_to_sql, CteTables};
+    use crate::catalog::{Catalog, ColumnDef, VirtualTable};
     use crate::parser::FilterNode;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::{self, File};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn renders_filter_values_safely_for_http_query_parameters() {
@@ -1083,5 +1349,79 @@ mod tests {
             filter_to_sql(&filter),
             "(\"year\" = '2024') AND (\"city\"\"name\" = 'Sorriso'' OR 1=1 --')"
         );
+    }
+
+    #[test]
+    fn parquet_schema_and_filter_are_read_into_arrow_batches() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "federated-engine-parquet-{}-{}.parquet",
+            std::process::id(),
+            nonce
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "year",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![2022, 2023, 2024]))],
+        )
+        .unwrap();
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let inferred = crate::connectors::parquet::infer_schema(path.to_str().unwrap()).unwrap();
+        assert_eq!(inferred.field(0).name(), "year");
+        assert_eq!(inferred.field(0).data_type(), &DataType::Int64);
+
+        let mut catalog = Catalog::new();
+        catalog
+            .workspaces
+            .get_mut("default")
+            .unwrap()
+            .tables
+            .insert(
+                "rainfall".to_string(),
+                VirtualTable {
+                    name: "rainfall".to_string(),
+                    format: "PARQUET".to_string(),
+                    physical_path: path.to_string_lossy().into_owned(),
+                    source_url: None,
+                    columns: vec![ColumnDef {
+                        name: "year".to_string(),
+                        data_type: "Int64".to_string(),
+                    }],
+                },
+            );
+
+        let result = fetch_and_filter_batches(
+            "rainfall",
+            &Some(FilterNode::Condition {
+                column: "year".to_string(),
+                operator: ">=".to_string(),
+                value: "2024".to_string(),
+            }),
+            &None,
+            &catalog,
+            "default",
+            &CteTables::new(),
+        )
+        .unwrap();
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let years = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(years.value(0), 2024);
+
+        fs::remove_file(path).unwrap();
     }
 }

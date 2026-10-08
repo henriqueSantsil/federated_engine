@@ -15,6 +15,7 @@ COMANDOS SUPORTADOS - FEDERATED ENGINE
 
 [ MAPEAMENTO DE DADOS (LOCAL E REDE) ]
   CREATE EXTERNAL TABLE <nome> LOCATION '<caminho.csv>';
+  CREATE EXTERNAL TABLE <nome> LOCATION '<caminho.parquet>';
   CREATE EXTERNAL TABLE <nome> LOCATION 'http://IP:8080/query?view=nome';
   -- Views P2P mapeiam o esquema sem baixar os dados; filtros sao enviados ao no remoto.
   CREATE VIEW <nome> AS SELECT ...;
@@ -29,6 +30,7 @@ COMANDOS SUPORTADOS - FEDERATED ENGINE
 [ MARKETPLACE & P2P (REDE LOCAL) ]
   PUBLISH VIEW <nome>;          -> Expoe uma View local para a rede
   SERVE ON <porta>;             -> Inicia o servidor transmissor de dados
+  SERVE PG ON <porta>;          -> Inicia o servidor compativel com PostgreSQL
   SHOW NETWORK NODES;          -> Descobre nos da engine na sub-rede local (porta 8080)
 
 [ CACHE REMOTO ]
