@@ -288,4 +288,4 @@ Pushing a version tag such as `v0.1.0` triggers [the release workflow](.github/w
 
 Issues and pull requests are welcome. For code changes, include focused tests for behavior changes and run `cargo fmt --check` and `cargo test` before submitting.
 
-Before publishing this repository as open source, add a `LICENSE` file with the project's chosen license and ensure all included dependencies, sample data, and other assets can be redistributed under their applicable terms. This repository currently does not declare a project license.
+
